@@ -74,6 +74,24 @@ export default function App() {
   const [view, setView] = useState('lab'); // 'lab' | 'learn' — separate beginner tab
   const [learnFromError, setLearnFromError] = useState(false);
   const [hlCoins, setHlCoins] = useState([]);
+  const [hlLoading, setHlLoading] = useState(false);
+  // (Re)discover Hyperliquid coins. Manual retry matters: if the first fetch
+  // fails (offline at load, blocked API), xyz stocks silently vanish from
+  // search until the user reloads — this lets them heal it in place.
+  const rediscoverHL = useCallback(() => {
+    setHlLoading(true);
+    providerForMarket('hyperliquid').discover()
+      .then((coins) => {
+        if (coins?.length) {
+          setHlCoins((prev) => {
+            const seen = new Set(prev.map((c) => `${c.dex}|${c.symbol}`));
+            return [...prev, ...coins.filter((c) => !seen.has(`${c.dex}|${c.symbol}`))];
+          });
+        }
+      })
+      .catch(() => {})
+      .finally(() => setHlLoading(false));
+  }, []);
   const [query, setQuery] = useState('');
   const [customs, setCustoms] = useState([]); // user-loaded tickers not in the built-in list
   const [binSyms, setBinSyms] = useState(null); // all Binance spot symbols, lazy-loaded
@@ -294,8 +312,8 @@ export default function App() {
   }, []);
   useEffect(() => {
     // discover Hyperliquid coins (core + xyz) for search + metadata card
-    providerForMarket('hyperliquid').discover().then(setHlCoins).catch(() => {});
-  }, []);
+    rediscoverHL();
+  }, [rediscoverHL]);
   useEffect(() => {
     // lazy-load the full Binance spot symbol list for crypto search
     if (market !== 'crypto' || binSyms || binLoading) return;
@@ -401,9 +419,10 @@ export default function App() {
   })();
   const marketProps = {
     markets: MARKETS, market, symbol, asset, query, setQuery, filtered, allOptions,
-    hasExact, binSyms, binLoading, hlCoins, favorites, source, sourceDetail, customLabel,
+    hasExact, binSyms, binLoading, hlCoins, hlLoading, favorites, source, sourceDetail, customLabel,
     onPickMarket: pickMarket, onPickSymbol: pickSymbol, onLoadCustom: loadCustom,
-    onLoadFavorite: loadFavorite, onRemoveFavorite: (k) => setFavorites((prev) => prev.filter((x) => x !== k))
+    onLoadFavorite: loadFavorite, onRemoveFavorite: (k) => setFavorites((prev) => prev.filter((x) => x !== k)),
+    onRediscover: rediscoverHL
   };
 
   // Date-range window: all downstream math (indicators → backtest) uses this slice,

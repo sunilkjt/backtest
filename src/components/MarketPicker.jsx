@@ -5,8 +5,8 @@
 export default function MarketPicker(props) {
   const {
     markets, market, symbol, asset, query, setQuery, filtered, allOptions,
-    hasExact, binSyms, binLoading, hlCoins, favorites, source, sourceDetail, customLabel,
-    onPickMarket, onPickSymbol, onLoadCustom, onLoadFavorite, onRemoveFavorite
+    hasExact, binSyms, binLoading, hlCoins, hlLoading, favorites, source, sourceDetail, customLabel,
+    onPickMarket, onPickSymbol, onLoadCustom, onLoadFavorite, onRemoveFavorite, onRediscover
   } = props;
   return (
     <>
@@ -50,6 +50,11 @@ export default function MarketPicker(props) {
       {query.trim() && !hasExact && (
         <button className="btn ghost" style={{ marginTop: 8, width: '100%' }} onClick={() => onLoadCustom(query)}>
           {customLabel || (<>➕ Load “{query.trim().toUpperCase()}” as custom {market === 'hyperliquid' ? 'Hyperliquid coin (tip: xyz:TSLA format for equities)' : market === 'crypto' ? 'Binance symbol' : 'Yahoo ticker'}</>)}
+        </button>
+      )}
+      {market === 'hyperliquid' && hlCoins.length === 0 && (
+        <button className="btn ghost" style={{ marginTop: 8, width: '100%' }} onClick={onRediscover} disabled={hlLoading} title="Stocks live on the Hyperliquid xyz list — refetch it">
+          {hlLoading ? '⚡ Discovering Hyperliquid markets…' : '↻ Hyperliquid list missing — retry (stocks live here)'}
         </button>
       )}
       <p className="sub" style={{ marginTop: 10 }}>Tip: spaces and “/” are ignored — “op usdt”, “op/usdt” and “opusdt” all find OP.</p>
