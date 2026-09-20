@@ -26,6 +26,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [price, setPrice] = useState(null);
   const [compared, setCompared] = useState(null);
+  const [view, setView] = useState('lab'); // 'lab' | 'learn' — separate beginner tab
   const [hlCoins, setHlCoins] = useState([]);
   const [query, setQuery] = useState('');
   const [customs, setCustoms] = useState([]); // user-loaded tickers not in the built-in list
@@ -75,11 +76,23 @@ export default function App() {
   }, [assetList, extras]);
 
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = norm(query);
     if (!q) return allOptions.slice(0, 80);
-    return allOptions.filter((a) =>
-      a.symbol.toLowerCase().includes(q) || a.name.toLowerCase().includes(q) || String(a.ref).toLowerCase().includes(q)
-    ).slice(0, 80);
+    const base = stripQuote(q);
+    return allOptions.filter((a) => {
+      const sym = norm(a.symbol), nm = norm(a.name), rf = norm(a.ref);
+      if (sym.includes(q) || nm.includes(q) || rf.includes(q)) return true;
+      // "op usdt" → base "op" should still find OP / OPUSDT
+      return base.length >= 2 && (sym === base || sym.includes(base) || rf.includes(base));
+    }).slice(0, 80);
+  }, [allOptions, query]);
+
+  // Hide the custom-ticker button when the query already resolves exactly
+  // ("OP USDT" → OPUSDT exists, so no custom needed).
+  const hasExact = useMemo(() => {
+    const q = norm(query);
+    if (!q) return true;
+    return allOptions.some((a) => norm(a.symbol) === q || norm(a.ref) === q);
   }, [allOptions, query]);
 
   const resolveAsset = useCallback((m, sym, assetOverride) => {
@@ -272,7 +285,12 @@ export default function App() {
               placeholder={market === 'hyperliquid' ? 'Search 120+ coins — e.g. TSLA, xyz:PLTR, HYPE…' : market === 'crypto' ? 'Search Binance — e.g. PEPE, ONDO, ARB…' : 'Search or type any ticker — e.g. GOOGL, EURUSD=X…'}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && query.trim()) loadCustom(query); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && query.trim()) {
+                  if (filtered.length > 0) pickSymbol(filtered[0].symbol);
+                  else loadCustom(query);
+                }
+              }}
             />
             <p className="sub" style={{ margin: '6px 0' }}>
               {query.trim()
@@ -287,13 +305,14 @@ export default function App() {
                   {a.symbol}
                 </button>
               ))}
-              {filtered.length === 0 && <p className="sub">No match in the catalogue — load it as a custom ticker below.</p>}
+              {filtered.length === 0 && <p className="sub">No match — check spelling or load it as a custom ticker below.</p>}
             </div>
-            {query.trim() && !filtered.some((a) => a.symbol.toLowerCase() === query.trim().toLowerCase()) && (
+            {query.trim() && !hasExact && (
               <button className="btn ghost" style={{ marginTop: 8, width: '100%' }} onClick={() => loadCustom(query)}>
                 ➕ Load “{query.trim().toUpperCase()}” as custom {market === 'hyperliquid' ? 'Hyperliquid coin (tip: xyz:TSLA format for equities)' : market === 'crypto' ? 'Binance symbol' : 'Yahoo ticker'}
               </button>
             )}
+            <p className="sub" style={{ marginTop: 10 }}>Tip: spaces and “/” are ignored — “op usdt”, “op/usdt” and “opusdt” all find OP.</p>
             <p className="sub" style={{ marginTop: 10 }}>{asset?.name} · feed <code>{asset?.yahoo || asset?.ref}</code></p>
           </div>
 
@@ -375,6 +394,20 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            <div className="seg" style={{ marginTop: 16 }}>
+              <button className={view === 'lab' ? 'on' : ''} onClick={() => setView('lab')}>🔬 Lab view</button>
+              <button className={view === 'learn' ? 'on' : ''} onClick={() => setView('learn')}>🎓 Teach me — beginner view</button>
+            </div>
+
+            {view === 'learn' ? (
+              <LearnTab
+                asset={asset} market={market} timeframe={timeframe} strategy={strategy}
+                candles={candles} source={source} result={result} signal={signal}
+                ict={ict} risk={risk} providerLabel={providerForMarket(market).label}
+              />
+            ) : (
+            <>
 
             <div className="grid" style={{ gridTemplateColumns: 'repeat(12,1fr)', marginTop: 16 }}>
               <div className="card span8">
@@ -497,6 +530,8 @@ export default function App() {
                 </div>
               )}
             </div>
+              </>
+            )}
           </>
         )}
 
@@ -523,6 +558,105 @@ export default function App() {
       </div>
     </div>
   );
+}
+
+function LearnTab({ asset, market, timeframe, strategy, candles, source, result, signal, ict, risk, providerLabel }) {
+  const st = result.stats;
+  const first = candles[0], last = candles[candles.length - 1];
+  const periodMove = first && last ? ((last.close - first.close) / first.close) * 100 : 0;
+  const topBull = signal.reasons.filter((r) => r.side === 'bull').slice(0, 3);
+  const topBear = signal.reasons.filter((r) => r.side === 'bear').slice(0, 3);
+  return (
+    <>
+      <div className="card" style={{ marginTop: 16 }}>
+        <h2>📖 What just happened? — your run, step by step</h2>
+        <p className="sub">Read top to bottom. Each step feeds the next — that chain <i>is</i> the lab.</p>
+        <div className="reason"><span className="dot neutral" /><div><b>1 · Downloaded {candles.length} {timeframe} candles of {asset.symbol}</b><p>From {providerLabel} ({source === 'live' ? 'real market data' : 'DEMO simulation — practice numbers, not the market'}). Each candle = open, high, low, close + volume. Over this window the price moved {periodMove >= 0 ? 'up' : 'down'} {Math.abs(periodMove).toFixed(2)}%.</p></div><span className="pts">data</span></div>
+        <div className="reason"><span className="dot neutral" /><div><b>2 · Measured the market with 10 indicators</b><p>Trend (EMA/SMA/Supertrend/ADX), momentum (RSI/MACD/Stochastic) and volatility (Bollinger/ATR). Indicators don't predict — they describe what price already did, in numbers a rule can use.</p></div><span className="pts">measure</span></div>
+        <div className="reason"><span className="dot neutral" /><div><b>3 · Ran “{strategy.name}” on every candle</b><p>{strategy.description} That produced <b>{st.trades} completed trades</b> on this window. A backtest is a replay: “if I had followed this rule bar by bar, what would have happened?”</p></div><span className="pts">replay</span></div>
+        <div className="reason"><span className="dot neutral" /><div><b>4 · Subtracted real-world costs</b><p>{risk.feePct}% fee + {risk.slippagePct}% slippage per side, ATR ({risk.stopAtrMult}×) stop-loss and {risk.takeProfitRR}R take-profit on every trade. Costs are why the robot can be “right” and still lose money.</p></div><span className="pts">costs</span></div>
+        <div className="reason"><span className={`dot ${signal.direction === 'BUY' ? 'bull' : signal.direction === 'SELL' ? 'bear' : 'neutral'}`} /><div><b>5 · Verdict: {signal.direction} ({signal.score}/100, {signal.confidence} confidence)</b><p>Bull points {signal.bull} vs bear points {signal.bear}. 60+ with a clear edge = BUY, 40− = SELL, otherwise HOLD. The score is just bull ÷ (bull + bear) — count the points in the Lab view.</p></div><span className="pts">{signal.score}</span></div>
+      </div>
+
+      {st.trades === 0 ? (
+        <div className="card" style={{ marginTop: 16 }}>
+          <div className="alert">❓ <b>Why zero trades?</b> Nothing is broken — “{strategy.name}” simply never saw its setup in these {candles.length} candles (e.g. an SMA cross needs a slow 50/200 average cross, which can take months to occur). Try: another strategy (hit “Compare all”), a smaller timeframe, or more candles.</div>
+        </div>
+      ) : (
+        <div className="card" style={{ marginTop: 16 }}>
+          <h2>❓ Why {st.trades} trades — is that a lot?</h2>
+          <p className="sub">{st.trades > 80
+            ? 'Yes, that is busy — this rule flips direction often on this timeframe. Every flip pays fees twice, so busy strategies need a high win rate to survive. Compare with a slower rule.'
+            : st.trades > 20
+              ? 'A healthy sample — enough trades to judge the rule, not so many that fees dominate. Check profit factor and max drawdown before trusting it.'
+              : 'Only a few — each trade carries a lot of weight, so one lucky winner can flatter the result. Widen the candle count or try “Compare all” for context.'} Win rate {st.winRate.toFixed(1)}% · expectancy {money(st.expectancy)}/trade.</p>
+        </div>
+      )}
+
+      <div className="grid" style={{ gridTemplateColumns: 'repeat(12,1fr)', marginTop: 16 }}>
+        <div className="card span6">
+          <h2>⚖️ Why this signal, in plain words</h2>
+          <p className="sub">The three strongest pushes on each side right now.</p>
+          {topBull.map((r, i) => (<div className="reason" key={'b' + i}><span className="dot bull" /><div><b>{r.label}</b><p>{r.detail}</p></div><span className="pts">+{r.points}</span></div>))}
+          {topBull.length === 0 && <p className="sub">No bullish evidence right now.</p>}
+          {topBear.map((r, i) => (<div className="reason" key={'s' + i}><span className="dot bear" /><div><b>{r.label}</b><p>{r.detail}</p></div><span className="pts">+{r.points}</span></div>))}
+          {topBear.length === 0 && <p className="sub">No bearish evidence right now.</p>}
+          {ict && <p className="sub" style={{ marginTop: 8 }}>Smart-money read: <b>{ict.bias} ({ict.biasScore})</b> — {ict.zone}. Price sitting in premium/discount tells you whether buyers or sellers are paying up.</p>}
+        </div>
+        <div className="card span6">
+          <h2>📊 Your numbers, translated</h2>
+          <p className="sub">What each stat is really telling you.</p>
+          <div className="kv"><span>Net {money(st.totalNet)} ({st.totalReturnPct.toFixed(2)}%)</span><span><b>{st.totalNet > 0 ? 'Rule made money here' : 'Rule lost money here'}</b></span></div>
+          <div className="kv"><span>Win rate {st.winRate.toFixed(1)}%</span><span>Won {st.wins} of {st.trades} — below 50% can still profit if winners are bigger</span></div>
+          <div className="kv"><span>Profit factor {fmtPF(st.profitFactor)}</span><span>{st.profitFactor > 1.5 ? 'Winners clearly outweigh losers' : st.profitFactor > 1 ? 'Barely ahead — fragile' : 'Losers outweigh winners'}</span></div>
+          <div className="kv"><span>Max drawdown {st.maxDrawdownPct.toFixed(2)}%</span><span>Deepest dip from a peak — could you stomach that loss live?</span></div>
+          <div className="kv"><span>Expectancy {money(st.expectancy)}</span><span>Average $ per trade — the “wage” of this rule</span></div>
+          <div className="kv"><span>Sharpe {st.sharpe.toFixed(2)}</span><span>{st.sharpe > 1 ? 'Smooth ride for the return' : 'Bumpy ride — return came with volatility'}</span></div>
+        </div>
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <h2>🔎 When something looks wrong</h2>
+        <p className="sub">The three confusions beginners hit most — including the search one.</p>
+        <div className="reason"><span className="dot neutral" /><div><b>“I searched a coin and nothing backtested”</b><p>Almost always the search text, not the data: spaces and “/” are now ignored, so “op usdt”, “op/usdt” and “opusdt” all find OP. If a ticker truly isn't listed (e.g. a brand-new coin), use the ➕ custom button — Crypto adds USDT automatically, Hyperliquid equities need the <code>xyz:TSLA</code> format, Yahoo markets take any ticker like <code>GOOGL</code>.</p></div><span className="pts">search</span></div>
+        <div className="reason"><span className="dot neutral" /><div><b>“Historical data unavailable”</b><p>The exchange didn't answer (rate-limit, network, or a market too young to have that timeframe). Wait 10 seconds and retry, switch timeframe, or use clearly-labelled DEMO data to keep learning.</p></div><span className="pts">data</span></div>
+        <div className="reason"><span className="dot neutral" /><div><b>“Great backtest, but is it real?”</b><p>A backtest is a history exam, not a crystal ball: fees are estimates, big orders move real markets, and Hyperliquid xyz perps only exist since late 2025 (no 2020 history to test). Trust rules that win across strategies, timeframes and assets — then start tiny.</p></div><span className="pts">trust</span></div>
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <h2>📚 60-second glossary</h2>
+        <p className="sub">The only words the Lab uses, in one line each.</p>
+        <div className="tbl-wrap" style={{ maxHeight: 260 }}>
+          <table><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody>
+            {[
+              ['Candle', 'One period of trading: where price started, ended, and how far it roamed.'],
+              ['Long / Short', 'Long profits when price rises; short profits when it falls.'],
+              ['EMA / SMA', 'Average price over N candles — the market’s “recent consensus”. EMA reacts faster.'],
+              ['RSI', '0–100 speedometer of momentum. Above 70 = stretched up, below 30 = washed out.'],
+              ['MACD', 'Two averages pulling apart (trend pushing) or together (trend tiring).'],
+              ['Bollinger Bands', 'A rubber band around price — tags outside it often snap back.'],
+              ['ATR', 'Average candle size — the ruler we use to set stop-loss distance.'],
+              ['Supertrend', 'A trailing line that flips green/red with the trend.'],
+              ['BOS / CHOCH', 'Break of Structure / Change of Character — price broke its recent pattern.'],
+              ['Order block', 'The last “calm” candle before a big push — big players may defend it.'],
+              ['FVG (gap)', 'A price jump that left empty space — price often revisits it.'],
+              ['Liquidity sweep', 'Price pokes past obvious highs/lows to trigger stops, then reverses.'],
+              ['Drawdown', 'Biggest peak-to-trough fall — the pain you must survive.'],
+              ['Profit factor', 'Gross wins ÷ gross losses. Above 1.5 = healthy, below 1 = losing.'],
+              ['R-multiple', 'Win measured in “risks”: +2R means twice what you risked.'],
+            ].map(([t, d]) => (<tr key={t}><td><b>{t}</b></td><td style={{ textAlign: 'left', whiteSpace: 'normal' }}>{d}</td></tr>))}
+          </tbody></table>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function norm(s) {
+  return String(s || '').toLowerCase().replace(/[\s/_.\-]/g, '');
+}
+function stripQuote(s) {
+  return s.replace(/(usdt|usdc|fdusd|busd|tusd|dai|btc|eth|bnb)$/, '');
 }
 
 function Stat({ k, v, c }) {
