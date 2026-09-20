@@ -27,12 +27,68 @@ export default function App() {
   const [price, setPrice] = useState(null);
   const [compared, setCompared] = useState(null);
   const [hlCoins, setHlCoins] = useState([]);
+  const [query, setQuery] = useState('');
+  const [customs, setCustoms] = useState([]); // user-loaded tickers not in the built-in list
+  const [binSyms, setBinSyms] = useState(null); // all Binance spot symbols, lazy-loaded
+  const [binLoading, setBinLoading] = useState(false);
 
   const assetList = useMemo(() => assetsForMarket(market), [market]);
+  const knownAssets = useMemo(() => [...ASSETS, ...customs], [customs]);
   const asset = useMemo(
-    () => ASSETS.find((a) => a.market === market && a.symbol === symbol) || assetList[0],
-    [market, symbol, assetList]
+    () => knownAssets.find((a) => a.market === market && a.symbol === symbol) || assetList[0],
+    [market, symbol, assetList, knownAssets]
   );
+
+  // Discover extras: every Hyperliquid coin (core + xyz) and every Binance
+  // spot symbol beyond the built-in shortlist, so search covers everything.
+  const extras = useMemo(() => {
+    const out = [];
+    const builtRefs = new Set(ASSETS.map((a) => a.market + '|' + a.ref));
+    if (market === 'hyperliquid') {
+      for (const c of hlCoins) {
+        if (builtRefs.has('hyperliquid|' + c.symbol)) continue;
+        const short = c.symbol.includes(':') ? c.symbol.split(':')[1] : c.symbol;
+        out.push({ market: 'hyperliquid', symbol: short, name: `${short} (${c.dex === 'xyz' ? 'Hyperliquid xyz' : 'Hyperliquid'})`, ref: c.symbol, decimals: 3, extra: true });
+      }
+    }
+    if (market === 'crypto' && Array.isArray(binSyms)) {
+      for (const s of binSyms) {
+        if (builtRefs.has('crypto|' + s)) continue;
+        const base = s.endsWith('USDT') ? s.slice(0, -4) : s;
+        out.push({ market: 'crypto', symbol: base, name: `${base} / USDT (Binance)`, ref: s, decimals: 4, extra: true });
+      }
+    }
+    for (const c of customs) {
+      if (c.market === market && !out.some((o) => o.symbol === c.symbol)) out.push(c);
+    }
+    return out;
+  }, [market, hlCoins, binSyms, customs]);
+
+  const allOptions = useMemo(() => {
+    const seen = new Set();
+    return [...assetList, ...extras].filter((a) => {
+      const k = a.symbol + '|' + a.ref;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  }, [assetList, extras]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return allOptions.slice(0, 80);
+    return allOptions.filter((a) =>
+      a.symbol.toLowerCase().includes(q) || a.name.toLowerCase().includes(q) || String(a.ref).toLowerCase().includes(q)
+    ).slice(0, 80);
+  }, [allOptions, query]);
+
+  const resolveAsset = useCallback((m, sym, assetOverride) => {
+    if (assetOverride) return assetOverride;
+    return knownAssets.find((x) => x.market === m && x.symbol === sym)
+      || extras.find((x) => x.symbol === sym)
+      || ASSETS.find((x) => x.market === m && x.symbol === sym)
+      || assetsForMarket(m)[0];
+  }, [knownAssets, extras]);
 
   const fetchData = useCallback(async (opts = {}) => {
     const m = opts.market ?? market;
@@ -40,7 +96,7 @@ export default function App() {
     const tf = opts.timeframe ?? timeframe;
     const lim = opts.limit ?? limit;
     const useDemo = opts.demoMode ?? demoMode;
-    const a = ASSETS.find((x) => x.market === m && x.symbol === sym) || assetsForMarket(m)[0];
+    const a = resolveAsset(m, sym, opts.asset);
     if (!a) return;
     setLoading(true);
     setError('');
@@ -65,28 +121,77 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [market, symbol, timeframe, limit, demoMode]);
+  }, [market, symbol, timeframe, limit, demoMode, resolveAsset]);
 
   useEffect(() => { fetchData({}); }, []); // auto-run on load
   useEffect(() => {
-    // discover Hyperliquid coins for the metadata card (non-blocking)
+    // discover Hyperliquid coins (core + xyz) for search + metadata card
     providerForMarket('hyperliquid').discover().then(setHlCoins).catch(() => {});
   }, []);
+  useEffect(() => {
+    // lazy-load the full Binance spot symbol list for crypto search
+    if (market !== 'crypto' || binSyms || binLoading) return;
+    setBinLoading(true);
+    fetch('https://data-api.binance.vision/api/v3/exchangeInfo')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('exchangeInfo'))))
+      .then((j) => {
+        const syms = (j?.symbols || [])
+          .filter((s) => s.status === 'TRADING' && s.quoteAsset === 'USDT' && s.isSpotTradingAllowed)
+          .map((s) => s.symbol);
+        setBinSyms(syms);
+      })
+      .catch(() => setBinSyms([]))
+      .finally(() => setBinLoading(false));
+  }, [market, binSyms, binLoading]);
 
   const pickMarket = (m) => {
     const first = assetsForMarket(m)[0];
     setMarket(m);
     setSymbol(first.symbol);
+    setQuery('');
     setCompared(null);
-    setTimeout(() => fetchData({ market: m, symbol: first.symbol }), 0);
+    setTimeout(() => fetchData({ market: m, symbol: first.symbol, asset: first }), 0);
   };
   const pickSymbol = (s) => {
-    setSymbol(s);
-    setTimeout(() => fetchData({ symbol: s }), 0);
+    const a = resolveAsset(market, s);
+    setSymbol(a.symbol);
+    setCompared(null);
+    setTimeout(() => fetchData({ symbol: a.symbol, asset: a }), 0);
   };
   const pickTf = (t) => {
     setTimeframe(t);
     setTimeout(() => fetchData({ timeframe: t }), 0);
+  };
+
+  // Build a loadable asset from a raw ticker typed into search.
+  const buildCustom = (raw) => {
+    const q = raw.trim();
+    if (!q) return null;
+    if (market === 'hyperliquid') {
+      const ref = q.includes(':')
+        ? q.split(':')[0].toLowerCase() + ':' + q.split(':').slice(1).join(':').toUpperCase()
+        : q.toUpperCase();
+      const sym = ref.includes(':') ? ref.split(':')[1] : ref;
+      return { market, symbol: sym, name: `${sym} (Hyperliquid custom)`, ref, decimals: 3, extra: true, custom: true };
+    }
+    if (market === 'crypto') {
+      const clean = q.toUpperCase().replace(/[\s/-]/g, '');
+      const ref = /USDT|USDC|BTC$/.test(clean) ? clean : clean + 'USDT';
+      const sym = ref.endsWith('USDT') ? ref.slice(0, -4) : ref;
+      return { market, symbol: sym, name: `${sym} (Binance custom)`, ref, decimals: 4, extra: true, custom: true };
+    }
+    // forex / stocks / commodities → Yahoo ticker directly
+    const yahoo = q.toUpperCase();
+    return { market, symbol: yahoo, name: `${yahoo} (custom ticker)`, ref: q.toLowerCase(), yahoo, decimals: market === 'forex' ? 5 : 2, extra: true, custom: true };
+  };
+
+  const loadCustom = (raw) => {
+    const a = buildCustom(raw);
+    if (!a) return;
+    setCustoms((prev) => (prev.some((x) => x.market === a.market && x.symbol === a.symbol) ? prev : [...prev, a]));
+    setSymbol(a.symbol);
+    setCompared(null);
+    setTimeout(() => fetchData({ symbol: a.symbol, asset: a }), 0);
   };
 
   const ind = useMemo(() => (candles.length ? computeAll(candles) : null), [candles]);
@@ -161,13 +266,34 @@ export default function App() {
                 <button key={m.id} className={market === m.id ? 'on' : ''} onClick={() => pickMarket(m.id)}>{m.icon} {m.label}</button>
               ))}
             </div>
+            <label className="lbl">🔍 Search every asset</label>
+            <input
+              type="text"
+              placeholder={market === 'hyperliquid' ? 'Search 120+ coins — e.g. TSLA, xyz:PLTR, HYPE…' : market === 'crypto' ? 'Search Binance — e.g. PEPE, ONDO, ARB…' : 'Search or type any ticker — e.g. GOOGL, EURUSD=X…'}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && query.trim()) loadCustom(query); }}
+            />
+            <p className="sub" style={{ margin: '6px 0' }}>
+              {query.trim()
+                ? `${filtered.length} match${filtered.length === 1 ? '' : 'es'} for “${query.trim()}”`
+                : `${allOptions.length} assets available`
+              }{market === 'crypto' ? (binSyms ? '' : binLoading ? ' · loading full Binance list…' : '') : market === 'hyperliquid' ? (hlCoins.length ? '' : ' · discovering Hyperliquid markets…') : ''}
+              {allOptions.length > filtered.length && !query.trim() && ` · showing ${filtered.length} — search to narrow`}
+            </p>
             <div className="asset-grid">
-              {assetList.map((a) => (
-                <button key={a.symbol} className={symbol === a.symbol ? 'on chip' : 'chip'} style={symbol === a.symbol ? { background: 'linear-gradient(90deg,#22d3ee,#a78bfa)', color: '#06101f', fontWeight: 800, border: 'none' } : {}} onClick={() => pickSymbol(a.symbol)} title={a.name}>
+              {filtered.map((a) => (
+                <button key={a.symbol + '|' + a.ref} className={symbol === a.symbol ? 'on chip' : 'chip'} style={symbol === a.symbol ? { background: 'linear-gradient(90deg,#22d3ee,#a78bfa)', color: '#06101f', fontWeight: 800, border: 'none' } : {}} onClick={() => pickSymbol(a.symbol)} title={`${a.name} · feed ${a.yahoo || a.ref}`}>
                   {a.symbol}
                 </button>
               ))}
+              {filtered.length === 0 && <p className="sub">No match in the catalogue — load it as a custom ticker below.</p>}
             </div>
+            {query.trim() && !filtered.some((a) => a.symbol.toLowerCase() === query.trim().toLowerCase()) && (
+              <button className="btn ghost" style={{ marginTop: 8, width: '100%' }} onClick={() => loadCustom(query)}>
+                ➕ Load “{query.trim().toUpperCase()}” as custom {market === 'hyperliquid' ? 'Hyperliquid coin (tip: xyz:TSLA format for equities)' : market === 'crypto' ? 'Binance symbol' : 'Yahoo ticker'}
+              </button>
+            )}
             <p className="sub" style={{ marginTop: 10 }}>{asset?.name} · feed <code>{asset?.yahoo || asset?.ref}</code></p>
           </div>
 
