@@ -37,23 +37,23 @@ export const ASSETS = [
   { market: 'hyperliquid', symbol: 'SOL', name: 'Solana Perp', ref: 'SOL', decimals: 2 },
   { market: 'hyperliquid', symbol: 'DOGE', name: 'Dogecoin Perp', ref: 'DOGE', decimals: 5 },
   { market: 'hyperliquid', symbol: 'SUI', name: 'Sui Perp', ref: 'SUI', decimals: 4 },
-  // Forex (Stooq)
-  { market: 'forex', symbol: 'EUR/USD', name: 'Euro / US Dollar', ref: 'eurusd', decimals: 5 },
-  { market: 'forex', symbol: 'GBP/USD', name: 'British Pound / US Dollar', ref: 'gbpusd', decimals: 5 },
-  { market: 'forex', symbol: 'USD/JPY', name: 'US Dollar / Japanese Yen', ref: 'usdjpy', decimals: 3 },
-  { market: 'forex', symbol: 'AUD/USD', name: 'Australian Dollar / US Dollar', ref: 'audusd', decimals: 5 },
-  { market: 'forex', symbol: 'USD/CHF', name: 'US Dollar / Swiss Franc', ref: 'usdchf', decimals: 5 },
-  // Stocks (Stooq .us)
-  { market: 'stocks', symbol: 'AAPL', name: 'Apple Inc.', ref: 'aapl.us', decimals: 2 },
-  { market: 'stocks', symbol: 'MSFT', name: 'Microsoft', ref: 'msft.us', decimals: 2 },
-  { market: 'stocks', symbol: 'NVDA', name: 'NVIDIA', ref: 'nvda.us', decimals: 2 },
-  { market: 'stocks', symbol: 'TSLA', name: 'Tesla', ref: 'tsla.us', decimals: 2 },
-  { market: 'stocks', symbol: 'AMZN', name: 'Amazon', ref: 'amzn.us', decimals: 2 },
-  // Commodities (Stooq)
-  { market: 'commodities', symbol: 'XAU/USD', name: 'Gold Spot', ref: 'xauusd', decimals: 2 },
-  { market: 'commodities', symbol: 'XAG/USD', name: 'Silver Spot', ref: 'xagusd', decimals: 3 },
-  { market: 'commodities', symbol: 'WTI', name: 'WTI Crude Oil', ref: 'cl.f', decimals: 2 },
-  { market: 'commodities', symbol: 'BRENT', name: 'Brent Crude Oil', ref: 'bz.f', decimals: 2 }
+  // Forex (Yahoo Finance, CORS-safe via proxy fallback)
+  { market: 'forex', symbol: 'EUR/USD', name: 'Euro / US Dollar', ref: 'eurusd', yahoo: 'EURUSD=X', decimals: 5 },
+  { market: 'forex', symbol: 'GBP/USD', name: 'British Pound / US Dollar', ref: 'gbpusd', yahoo: 'GBPUSD=X', decimals: 5 },
+  { market: 'forex', symbol: 'USD/JPY', name: 'US Dollar / Japanese Yen', ref: 'usdjpy', yahoo: 'JPY=X', decimals: 3 },
+  { market: 'forex', symbol: 'AUD/USD', name: 'Australian Dollar / US Dollar', ref: 'audusd', yahoo: 'AUDUSD=X', decimals: 5 },
+  { market: 'forex', symbol: 'USD/CHF', name: 'US Dollar / Swiss Franc', ref: 'usdchf', yahoo: 'CHF=X', decimals: 5 },
+  // Stocks (Yahoo Finance)
+  { market: 'stocks', symbol: 'AAPL', name: 'Apple Inc.', ref: 'aapl.us', yahoo: 'AAPL', decimals: 2 },
+  { market: 'stocks', symbol: 'MSFT', name: 'Microsoft', ref: 'msft.us', yahoo: 'MSFT', decimals: 2 },
+  { market: 'stocks', symbol: 'NVDA', name: 'NVIDIA', ref: 'nvda.us', yahoo: 'NVDA', decimals: 2 },
+  { market: 'stocks', symbol: 'TSLA', name: 'Tesla', ref: 'tsla.us', yahoo: 'TSLA', decimals: 2 },
+  { market: 'stocks', symbol: 'AMZN', name: 'Amazon', ref: 'amzn.us', yahoo: 'AMZN', decimals: 2 },
+  // Commodities (Yahoo futures)
+  { market: 'commodities', symbol: 'XAU/USD', name: 'Gold Spot', ref: 'xauusd', yahoo: 'GC=F', decimals: 2 },
+  { market: 'commodities', symbol: 'XAG/USD', name: 'Silver Spot', ref: 'xagusd', yahoo: 'SI=F', decimals: 3 },
+  { market: 'commodities', symbol: 'WTI', name: 'WTI Crude Oil', ref: 'cl.f', yahoo: 'CL=F', decimals: 2 },
+  { market: 'commodities', symbol: 'BRENT', name: 'Brent Crude Oil', ref: 'bz.f', yahoo: 'BZ=F', decimals: 2 }
 ];
 
 export function assetsForMarket(market) {

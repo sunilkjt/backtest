@@ -53,10 +53,10 @@ export default function App() {
         setPrice(null);
       } else {
         const provider = providerForMarket(m);
-        const data = await provider.getCandles({ symbol: a.symbol, ref: a.ref, timeframe: tf, limit: lim });
+        const data = await provider.getCandles({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo, timeframe: tf, limit: lim });
         setCandles(data);
         setSource('live');
-        provider.getPrice({ symbol: a.symbol, ref: a.ref }).then(setPrice).catch(() => {});
+        provider.getPrice({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo }).then(setPrice).catch(() => {});
       }
     } catch (e) {
       setCandles([]);
@@ -168,7 +168,7 @@ export default function App() {
                 </button>
               ))}
             </div>
-            <p className="sub" style={{ marginTop: 10 }}>{asset?.name} · provider ref <code>{asset?.ref}</code></p>
+            <p className="sub" style={{ marginTop: 10 }}>{asset?.name} · feed <code>{asset?.yahoo || asset?.ref}</code></p>
           </div>
 
           <div className="card span4">
@@ -222,7 +222,7 @@ export default function App() {
         )}
         {error && !loading && (
           <div className="card" style={{ marginTop: 16 }}>
-            <div className="alert err">⚠️ <b>{error}</b><br />The provider could not supply this market/timeframe. Intraday Forex/Stocks/Commodities history is limited on the free Stooq feed — try <b>1D</b> or <b>1W</b>, or run the clearly-labelled demo below.</div>
+            <div className="alert err">⚠️ <b>{error}</b><br />The provider could not supply this market/timeframe right now (network or rate-limit). Wait a few seconds and retry, try another timeframe, or run the clearly-labelled demo below.</div>
             <div className="toolbar">
               <button className="btn pink" onClick={() => { setDemoMode(true); fetchData({ demoMode: true }); }}>🎭 Load DEMO (simulated) data</button>
               <button className="btn ghost" onClick={() => { setTimeframe('1d'); fetchData({ timeframe: '1d', demoMode: false }); }}>Try 1D live data</button>
@@ -388,7 +388,7 @@ export default function App() {
           Strategies emit bar-close signals with no lookahead; the backtester sizes positions by <i>risk% ÷ ATR-stop distance</i>, deducts fees + slippage both sides, and enforces ATR stops, R-multiple targets and optional shorts.
           Confluence = bull-points ÷ (bull + bear) × 100 across trend, momentum, volatility, price-action and ICT checks — every point is listed above.
           <br /><br />
-          Data: Crypto via <b>Binance Vision</b> spot klines · Hyperliquid via public <b>info</b> API · Forex/Stocks/Commodities via <b>Stooq</b> free CSV (daily/weekly; intraday shows “Historical data unavailable from this provider” when unsupported).
+          Data: Crypto via <b>Binance Vision</b> spot klines · Hyperliquid via public <b>info</b> API · Forex/Stocks/Commodities via <b>Yahoo Finance</b> chart API (all timeframes; 4H resampled from 1H; fetched CORS-safe with proxy fallback, Stooq daily as last resort).
           Demo data is deterministic simulation and is always labelled <b>DEMO</b> — never presented as live.
           <br /><br />
           ⚠️ Educational software. Not financial advice. Hypothetical backtests do not guarantee future results. ·
