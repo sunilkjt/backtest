@@ -192,6 +192,9 @@ export function obStateAt(o, i) {
 
 // Snapshot of everything knowable at the close of bar i. All lists contain
 // only facts with effect dates <= i — safe for historical strategies.
+// Transition logs are clipped to i: the raw log keeps growing with future
+// bars, and spreading it unclipped would leak future resolutions into the
+// snapshot object even though .state itself is correct.
 export function stateAt(eng, i) {
   const swingsH = eng.swingsH.filter((s) => s.confirmation <= i);
   const swingsL = eng.swingsL.filter((s) => s.confirmation <= i);
@@ -199,10 +202,10 @@ export function stateAt(eng, i) {
   const sweeps = eng.sweeps.filter((e) => e.index <= i);
   const fvgs = eng.fvgs
     .filter((g) => g.created <= i)
-    .map((g) => ({ ...g, state: fvgStateAt(g, i), age: i - g.created }));
+    .map((g) => ({ ...g, transitions: g.transitions.filter((t) => t.index <= i), state: fvgStateAt(g, i), age: i - g.created }));
   const obs = eng.obs
     .filter((o) => o.created <= i)
-    .map((o) => ({ ...o, state: obStateAt(o, i) }));
+    .map((o) => ({ ...o, transitions: o.transitions.filter((t) => t.index <= i), state: obStateAt(o, i) }));
   const breakers = obs.filter((o) => o.state === 'breaker');
   return { swingsH, swingsL, bos, sweeps, fvgs, obs, breakers };
 }

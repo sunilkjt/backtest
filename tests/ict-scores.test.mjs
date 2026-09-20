@@ -80,8 +80,10 @@ describe('scores / regime / levels', () => {  it('scores stay in 0..100 and list
     assert.equal(r.session.bias, 1);
   });
   it('regime gate vetoes counter-regime signals below 78', () => {
-    // Deterministic demo seed that scores a sub-78 BUY (verified: BUY 77).
-    const candles = generateDemoCandles('BTC', '1h', 300);
+    // Deterministic demo seed that scores a sub-78 BUY with margin (SOL 1h ≈ 65).
+    // BTC 1h sits exactly on the 78 boundary and flips with the wall-clock
+    // session (killzone ±5pts), so it must not be used as the veto fixture.
+    const candles = generateDemoCandles('SOL', '1h', 300);
     const ind = computeAll(candles);
     const ict = analyzeICT(candles);
     const free = buildSignal(candles, ind, ict, { technical: 60, ict: 40 });

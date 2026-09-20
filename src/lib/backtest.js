@@ -20,6 +20,7 @@ export const DEFAULT_RISK = {
   liquidationModel: 'isolated-simple', // see riskModels.js — always approximate
   liquidationMmr: 0.01, // maintenance margin for venue-style models
   periodsPerYear: 252, // bars/year of the traded timeframe (Sharpe annualization)
+  execution: 'open',   // 'open' = enter/exit at next candle open (default, realistic); 'close' = same-bar close
   funding: null        // [{timestamp, rate}] perp funding; positive = longs pay
 };
 
@@ -80,6 +81,10 @@ export function runBacktest(candles, ind, strategyId, risk = {}, sparams = {}) {
   for (let i = 1; i < candles.length; i++) {
     const price = candles[i].close;
     const atr = atrArr[i] ?? (price * 0.01);
+    // Execution price: next candle open (default) or same-bar close.
+    // Bar i+1's open is used only when bar i+1 EXISTS — never the future
+    // beyond the signal bar's next open.
+    const execOpen = r.execution === 'open' && i + 1 < candles.length;
 
     // 1) manage open position (liquidation → stop → target → time-stop)
     if (position) {
@@ -111,27 +116,32 @@ export function runBacktest(candles, ind, strategyId, risk = {}, sparams = {}) {
     let sig = 0;
     try { sig = strat.signal(candles, ind, i, sparams); } catch { sig = 0; }
     if (sig !== 0 && !(sig === -1 && !r.allowShort)) {
+      // exits on reversal use the same execution basis as entries
+      const xPrice = execOpen ? candles[i + 1].open : price;
+      const xIdx = execOpen ? i + 1 : i;
       if (position) {
-        const t = closePosition(position, price, i, candles[i].timestamp, r, 'reverse');
+        const t = closePosition(position, xPrice, xIdx, candles[xIdx].timestamp, r, 'reverse');
         cash = position.entryEquity + t.net;
         trades.push(t);
         position = null;
       }
       const eqNow = markEquity(i);
       const dir = sig;
-      const stopDist = Math.max(atr * r.stopAtrMult, price * 0.0005);
-      const stop = dir === 1 ? price - stopDist : price + stopDist;
-      const target = dir === 1 ? price + stopDist * r.takeProfitRR : price - stopDist * r.takeProfitRR;
+      const entryPrice = execOpen ? candles[i + 1].open : price;
+      const entryIdx = execOpen ? i + 1 : i;
+      const stopDist = Math.max(atr * r.stopAtrMult, entryPrice * 0.0005);
+      const stop = dir === 1 ? entryPrice - stopDist : entryPrice + stopDist;
+      const target = dir === 1 ? entryPrice + stopDist * r.takeProfitRR : entryPrice - stopDist * r.takeProfitRR;
       const riskAmt = eqNow * (r.riskPct / 100);
-      let qty = stopDist > 0 ? riskAmt / stopDist : (eqNow * 0.1) / price;
+      let qty = stopDist > 0 ? riskAmt / stopDist : (eqNow * 0.1) / entryPrice;
       // leverage caps notional at equity × leverage
-      const maxQty = (eqNow * lev) / price;
+      const maxQty = (eqNow * lev) / entryPrice;
       if (qty > maxQty) qty = maxQty;
       if (qty > 0 && Number.isFinite(qty)) {
-        const liq = lev > 1 ? liquidationPrice(r.liquidationModel || 'isolated-simple', price, dir, lev, r.liquidationMmr) : null;
+        const liq = lev > 1 ? liquidationPrice(r.liquidationModel || 'isolated-simple', entryPrice, dir, lev, r.liquidationMmr) : null;
         position = {
-          dir, entry: price, qty, stop, target, liq, entryIdx: i,
-          entryTime: candles[i].timestamp, entryEquity: eqNow, riskAmt, leverage: lev
+          dir, entry: entryPrice, qty, stop, target, liq, entryIdx,
+          entryTime: candles[entryIdx].timestamp, entryEquity: eqNow, riskAmt, leverage: lev
         };
         continue;
       }

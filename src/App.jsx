@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Robot from './components/Robot.jsx';
 import CandleChart, { OscillatorPanel, OverlayToggles, DEFAULT_OVERLAYS } from './components/CandleChart.jsx';
 import EquityChart from './components/EquityChart.jsx';
@@ -13,6 +13,11 @@ import { detectRegime, tradeLevels, dayChange } from './lib/scores.js';
 import { liquidationPrice, liqLabel, PERIODS_PER_YEAR } from './lib/riskModels.js';
 import { generateDemoCandles } from './lib/demo.js';
 import { tradesToCsv, signalsToCsv, strategyToJson, analysisReport, download, summaryText } from './lib/export.js';
+import RiskCalc from './components/RiskCalc.jsx';
+import IctPanel from './components/IctPanel.jsx';
+import TradesTable from './components/TradesTable.jsx';
+import SignalsPage, { SignalHistory } from './components/SignalsPage.jsx';
+import { logSignal, loadHistory, clearHistory, entryStatus } from './lib/history.js';
 
 // Persisted user state (localStorage).
 const LS_KEY = 'ai-trading-lab:v1';
@@ -22,6 +27,7 @@ function loadLS() {
 
 export default function App() {
   const ls = useMemo(loadLS, []);
+  const [page, setPage] = useState(ls.page || 'lab');
   const [market, setMarket] = useState(ls.market || 'crypto');
   const [symbol, setSymbol] = useState(ls.symbol || 'BTC');
   const [timeframe, setTimeframe] = useState(ls.timeframe || '1h');
@@ -50,6 +56,17 @@ export default function App() {
   const [wf, setWf] = useState(null);
   const [mtf, setMtf] = useState(null);
   const [mtfLoading, setMtfLoading] = useState(false);
+  // Signals command-center state
+  const [minConf, setMinConf] = useState(ls.minConf ?? 60);
+  const [minRR, setMinRR] = useState(ls.minRR ?? 1.5);
+  const [tz, setTz] = useState(ls.tz ?? 0);
+  const [sizer, setSizer] = useState(ls.sizer || { balance: 10000, riskPct: 1, lev: 1 });
+  const [history, setHistory] = useState(() => loadHistory());
+  const [histFilter, setHistFilter] = useState('ALL');
+  const [autoRefresh, setAutoRefresh] = useState('0');
+  const [showTop, setShowTop] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [focus, setFocus] = useState(null);
   const [view, setView] = useState('lab'); // 'lab' | 'learn' — separate beginner tab
   const [learnFromError, setLearnFromError] = useState(false);
   const [hlCoins, setHlCoins] = useState([]);
@@ -132,11 +149,12 @@ export default function App() {
   useEffect(() => {
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({
-        market, symbol, timeframe, strategyId, limit, risk, weights,
-        overlays, showOsc, favorites, compareIds, sparamsById, gateRegime
+        page, market, symbol, timeframe, strategyId, limit, risk, weights,
+        overlays, showOsc, favorites, compareIds, sparamsById, gateRegime,
+        minConf, minRR, tz, sizer
       }));
     } catch { /* storage full/blocked — lab still works */ }
-  }, [market, symbol, timeframe, strategyId, limit, risk, weights, overlays, showOsc, favorites, compareIds, sparamsById, gateRegime]);
+  }, [page, market, symbol, timeframe, strategyId, limit, risk, weights, overlays, showOsc, favorites, compareIds, sparamsById, gateRegime, minConf, minRR, tz, sizer]);
 
   const tick = () => new Promise((r) => setTimeout(r, 30));
 
@@ -155,11 +173,14 @@ export default function App() {
     setCompared(null);
     setWf(null);
     setMtf(null);
+    setFocus(null);
+    let data = null;
     try {
       if (useDemo) {
         setStage('Simulating demo candles…');
         await new Promise((r) => setTimeout(r, 350));
-        setRawCandles(generateDemoCandles(a.symbol, tf, lim));
+        data = generateDemoCandles(a.symbol, tf, lim);
+        setRawCandles(data);
         setFunding(null);
         setSourceDetail('Demo simulator (seeded random-walk)');
         setSource('demo');
@@ -168,7 +189,8 @@ export default function App() {
         setStage(`Downloading ${a.symbol} ${tf} from ${providerForMarket(m).label}…`);
         await tick();
         const provider = providerForMarket(m);
-        const data = await provider.getCandles({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo, timeframe: tf, limit: lim });
+        const fetched = await provider.getCandles({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo, timeframe: tf, limit: lim });
+        data = fetched;
         setSourceDetail(provider.lastSource || provider.label);
         setStage('Calculating indicators…');
         await tick();
@@ -189,12 +211,14 @@ export default function App() {
       }
       setStage('Running backtest…');
       await tick();
+      return data && data.length ? data : null;
     } catch (e) {
       setRawCandles([]);
       setFunding(null);
       setSourceDetail('');
       setPrice(null);
       setError(e?.message || UNAVAILABLE);
+      return null;
     } finally {
       setStage('');
       setLoading(false);
@@ -202,6 +226,13 @@ export default function App() {
   }, [market, symbol, timeframe, limit, demoMode, risk, useFunding, resolveAsset]);
 
   useEffect(() => { fetchData({}); }, []); // auto-run on load
+  useEffect(() => {
+    // Floating back-to-top arrow: appears after scrolling past one screen.
+    const onScroll = () => setShowTop(window.scrollY > 600);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
   useEffect(() => {
     // discover Hyperliquid coins (core + xyz) for search + metadata card
     providerForMarket('hyperliquid').discover().then(setHlCoins).catch(() => {});
@@ -304,6 +335,22 @@ export default function App() {
   const resetParams = () => {
     setSparamsById((prev) => { const n = { ...prev }; delete n[strategyId]; return n; });
   };
+  // Date-range presets: windows counted back from the last loaded candle.
+  const applyRangePreset = (days) => {
+    if (!rawCandles.length) return;
+    if (!days) { setDateRange({ from: '', to: '' }); return; }
+    const end = rawCandles[rawCandles.length - 1].timestamp;
+    setDateRange({ from: isoDay(end - days * 864e5), to: isoDay(end) });
+  };
+  const activePreset = useMemo(() => {
+    if (!rawCandles.length) return -1;
+    if (!dateRange.from && !dateRange.to) return 0;
+    const end = rawCandles[rawCandles.length - 1].timestamp;
+    for (const d of [30, 90, 180, 365]) {
+      if (dateRange.from === isoDay(end - d * 864e5) && dateRange.to === isoDay(end)) return d;
+    }
+    return -1;
+  }, [rawCandles, dateRange]);
   const result = useMemo(
     () => (candles.length && ind ? runBacktest(candles, ind, strategyId, riskEff, sparams) : null),
     [candles, ind, strategyId, riskEff, sparams]
@@ -374,6 +421,42 @@ export default function App() {
     }
   };
 
+  // Signals command center: explicit analysis run, logged to history.
+  // Uses the SAME fetch + engines as the backtest view (no second engine).
+  const analyzeMarket = useCallback(async () => {
+    const data = await fetchData({});
+    if (!data || !data.length) return;
+    const ii = computeAll(data);
+    const ic = analyzeICT(data);
+    const rg = detectRegime(data, ii);
+    const sg = buildSignal(data, ii, ic, weights, { regime: rg, gateRegime });
+    const lv = sg.direction !== 'NEUTRAL' ? tradeLevels(data, ii, ic, sg.direction, { ...risk, funding: null }) : null;
+    const entry = {
+      t: Date.now(), asset: (resolveAsset(market, symbol) || {}).symbol || symbol,
+      market, tf: timeframe, strategy: getStrategy(strategyId).name,
+      signal: sg.direction, score: sg.score, price: data[data.length - 1].close,
+      stop: lv ? lv.stop : null, dir: sg.direction === 'BUY' ? 1 : sg.direction === 'SELL' ? -1 : 0,
+      status: sg.direction === 'NEUTRAL' ? 'NO TRADE' : 'ACTIVE'
+    };
+    setHistory(logSignal(entry));
+    setLastUpdated(Date.now());
+  }, [fetchData, market, symbol, timeframe, strategyId, weights, gateRegime, risk, resolveAsset]);
+
+  const analyzeRef = useRef(analyzeMarket);
+  analyzeRef.current = analyzeMarket;
+  useEffect(() => {
+    if (autoRefresh === '0' || page !== 'signals') return;
+    const ms = Number(autoRefresh) * 60e3;
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    const id = setInterval(() => { analyzeRef.current(); }, ms);
+    return () => clearInterval(id);
+  }, [autoRefresh, page]);
+
+  const historyLive = useMemo(() => history.map((e) => ({
+    ...e,
+    liveStatus: entryStatus(e, e.asset === asset?.symbol && e.tf === timeframe ? lastClose : null)
+  })), [history, asset, timeframe, lastClose]);
+
   const toggleFav = () => {    if (!asset) return;
     const key = market + '|' + asset.symbol;
     setFavorites((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
@@ -417,6 +500,10 @@ export default function App() {
     catch { download('summary.txt', txt); }
   };
 
+  // Top-level tabs: 'lab' (backtest workbench) or 'signals' (command center).
+  // Anything else stored from older builds falls back to the lab.
+  const activePage = page === 'signals' ? 'signals' : 'lab';
+
   return (
     <div className="stars">
       <div className="wrap">
@@ -453,43 +540,68 @@ export default function App() {
           </div>
         </header>
 
+        <TopNav page={activePage} setPage={setPage} />
+
+        {activePage === 'signals' ? (
+          <SignalsPage
+            asset={asset} market={market} timeframe={timeframe}
+            strategy={strategy} strategies={STRATEGIES} strategyId={strategyId} setStrategyId={setStrategyId}
+            candles={candles} ind={ind} ict={ict} signal={signal} regime={regime} levels={levels}
+            source={source} riskEff={riskEff} weights={weights}
+            mtf={mtf} mtfLoading={mtfLoading} runMtf={runMtf}
+            providerLabel={providerForMarket(market).label}
+            onAnalyze={analyzeMarket} analyzing={loading} lastUpdated={lastUpdated}
+            autoRefresh={autoRefresh} setAutoRefresh={setAutoRefresh}
+            minConf={minConf} setMinConf={setMinConf} minRR={minRR} setMinRR={setMinRR}
+            tz={tz} setTz={setTz} sizer={sizer} setSizer={setSizer}
+            history={historyLive} histFilter={histFilter} setHistFilter={setHistFilter}
+            onClearHistory={() => setHistory(clearHistory())}
+            focus={focus} setFocus={setFocus} overlays={overlays}
+            lastClose={lastClose} error={error}
+          />
+        ) : (
+        <>
         {/* CONTROL DECK */}
         <div className="grid deck" id="markets">
           <div className="card span4">
             <h2>1️⃣ Market & Asset</h2>
             <p className="sub">Pick a laboratory bench. Hyperliquid serves perps; others serve spot / cash.</p>
-            <div className="seg" style={{ marginBottom: 10 }}>
+            <div className="seg market-seg">
               {MARKETS.map((m) => (
-                <button key={m.id} className={market === m.id ? 'on' : ''} onClick={() => pickMarket(m.id)}>{m.icon} {m.label}</button>
+                <button key={m.id} className={market === m.id ? 'on' : ''} onClick={() => pickMarket(m.id)} title={m.label}><span className="mi">{m.icon}</span><span>{m.label}</span></button>
               ))}
             </div>
             <label className="lbl">🔍 Search every asset</label>
-            <input
-              type="text"
-              placeholder={market === 'hyperliquid' ? 'Search 120+ coins — e.g. TSLA, xyz:PLTR, HYPE…' : market === 'crypto' ? 'Search Binance — e.g. PEPE, ONDO, ARB…' : 'Search or type any ticker — e.g. GOOGL, EURUSD=X…'}
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && query.trim()) {
-                  if (filtered.length > 0) pickSymbol(filtered[0].symbol);
-                  else loadCustom(query);
-                }
-              }}
-            />
-            <p className="sub" style={{ margin: '6px 0' }}>
-              {query.trim()
-                ? `${filtered.length} match${filtered.length === 1 ? '' : 'es'} for “${query.trim()}”`
-                : `${allOptions.length} assets available`
+            <div className="asset-search">
+              <span className="si">🔍</span>
+              <input
+                type="text"
+                placeholder={market === 'hyperliquid' ? 'Search 120+ coins — e.g. TSLA, xyz:PLTR, HYPE…' : market === 'crypto' ? 'Search Binance — e.g. PEPE, ONDO, ARB…' : 'Search or type any ticker — e.g. GOOGL, EURUSD=X…'}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && query.trim()) {
+                    if (filtered.length > 0) pickSymbol(filtered[0].symbol);
+                    else loadCustom(query);
+                  }
+                }}
+              />
+            </div>
+            <p className="asset-count">
+              <span className="pill">{query.trim() ? `${filtered.length} match${filtered.length === 1 ? '' : 'es'}` : `${allOptions.length} assets`}</span>
+              <span>{query.trim()
+                ? `for “${query.trim()}”`
+                : 'available'
               }{market === 'crypto' ? (binSyms ? '' : binLoading ? ' · loading full Binance list…' : '') : market === 'hyperliquid' ? (hlCoins.length ? '' : ' · discovering Hyperliquid markets…') : ''}
-              {allOptions.length > filtered.length && !query.trim() && ` · showing ${filtered.length} — search to narrow`}
+              {allOptions.length > filtered.length && !query.trim() && ` · showing ${filtered.length} — search to narrow`}</span>
             </p>
             <div className="asset-grid">
               {filtered.map((a) => (
-                <button key={a.symbol + '|' + a.ref} className={symbol === a.symbol ? 'on chip' : 'chip'} style={symbol === a.symbol ? { background: 'linear-gradient(90deg,#22d3ee,#a78bfa)', color: '#06101f', fontWeight: 800, border: 'none' } : {}} onClick={() => pickSymbol(a.symbol)} title={`${a.name} · feed ${a.yahoo || a.ref}`}>
+                <button key={a.symbol + '|' + a.ref} className={symbol === a.symbol ? 'on chip' : 'chip'} onClick={() => pickSymbol(a.symbol)} title={`${a.name} · feed ${a.yahoo || a.ref}`}>
                   {a.symbol}
                 </button>
               ))}
-              {filtered.length === 0 && <p className="sub">No match — check spelling or load it as a custom ticker below.</p>}
+              {filtered.length === 0 && <p className="sub asset-empty">No match — check spelling or load it as a custom ticker below.</p>}
             </div>
             {query.trim() && !hasExact && (
               <button className="btn ghost" style={{ marginTop: 8, width: '100%' }} onClick={() => loadCustom(query)}>
@@ -559,14 +671,24 @@ export default function App() {
             <label className="lbl">Candles (50–1000)</label>
             <input type="range" min={50} max={1000} step={10} value={limit} onChange={(e) => setLimit(Number(e.target.value))} />
             <div className="kv"><span>History length</span><span><b>{limit}</b> candles</span></div>
-            <label className="lbl">Date range (optional backtest window)</label>
-            <div className="row2">
-              <div><input type="date" value={dateRange.from} onChange={(e) => setDateRange({ ...dateRange, from: e.target.value })} /></div>
-              <div><input type="date" value={dateRange.to} onChange={(e) => setDateRange({ ...dateRange, to: e.target.value })} /></div>
+            <label className="lbl">📅 Date range (optional backtest window)</label>
+            <div className="date-bar">
+              <div className="date-presets">
+                {[['All', 0], ['1M', 30], ['3M', 90], ['6M', 180], ['1Y', 365]].map(([label, days]) => (
+                  <button key={label} className={activePreset === days ? 'on' : ''} onClick={() => applyRangePreset(days)} disabled={!rawCandles.length} title={days ? `Last ${label} of loaded candles` : 'Use the full loaded history'}>{label}</button>
+                ))}
+              </div>
+              <div className="date-fields">
+                <div><span className="df-lbl">🗓 From</span><input type="date" value={dateRange.from} onChange={(e) => setDateRange({ ...dateRange, from: e.target.value })} /></div>
+                <div><span className="df-lbl">🗓 To</span><input type="date" value={dateRange.to} onChange={(e) => setDateRange({ ...dateRange, to: e.target.value })} /></div>
+              </div>
+              <div className="date-meta">
+                <span className="in-window">📌 <b>{candles.length}</b> candles in window</span>
+                {(dateRange.from || dateRange.to) && (
+                  <button className="date-clear" onClick={() => setDateRange({ from: '', to: '' })}>✕ Clear</button>
+                )}
+              </div>
             </div>
-            {(dateRange.from || dateRange.to) && (
-              <div className="toolbar"><button className="btn ghost" onClick={() => setDateRange({ from: '', to: '' })}>Clear dates ({candles.length} in window)</button></div>
-            )}
           </div>
 
           <div className="card span4">
@@ -644,6 +766,9 @@ export default function App() {
                   </div>
                   <div className="gauge"><div style={{ width: `${signal.score}%` }} /></div>
                   <div className="gauge-marks"><span>0 · strong sell</span><span>40 · sell edge</span><span>50 · neutral</span><span>60 · buy edge</span><span>100 · strong buy</span></div>
+                  <div className="toolbar">
+                    <button className="btn ghost" onClick={() => { setPage('signals'); window.scrollTo({ top: 0 }); }}>🎯 Open detailed Signals page — thesis, plan, sizer & history →</button>
+                  </div>
                   {levels ? (
                     <div className="stats" style={{ marginTop: 10 }}>
                       <Stat k="Entry zone" v={fmtPrice(levels.entry, asset.decimals)} c="flat" />
@@ -781,61 +906,12 @@ export default function App() {
                 ))}
               </div>
               <div className="card span6">
-                <h2>🧠 ICT / SMC — smart-money map</h2>
-                <p className="sub">Bias <b>{ict.bias} ({ict.biasScore})</b> · {ict.zone} · range {fmtPrice(ict.range.low, asset.decimals)} – {fmtPrice(ict.range.high, asset.decimals)}</p>
-                <div className="kv"><span>Structure (last swings)</span><span><b>{[...ict.classified.highs.slice(-2).map((s) => s.kind), ...ict.classified.lows.slice(-2).map((s) => s.kind)].join(' · ') || '—'}</b></span></div>
-                <div className="kv"><span>Session</span><span><b>{ict.session ? `${ict.session.name}${ict.session.killzone ? ' ⚡ killzone' : ''}` : '—'}</b></span></div>
-                <div className="kv"><span>Prev day H / L</span><span><b>{ict.prevDay ? `${fmtPrice(ict.prevDay.high, asset.decimals)} / ${fmtPrice(ict.prevDay.low, asset.decimals)}` : '—'}</b></span></div>
-                <div className="kv"><span>Prev week H / L</span><span><b>{ict.prevWeek ? `${fmtPrice(ict.prevWeek.high, asset.decimals)} / ${fmtPrice(ict.prevWeek.low, asset.decimals)}` : '—'}</b></span></div>
-                <div className="kv"><span>Position in dealing range</span><span><b>{(ict.positionInRange * 100).toFixed(0)}%</b> (0% = range low)</span></div>
-                <div className="kv"><span>Liquidity pools (equal H/L)</span><span><b>{ict.pools?.length || 0}</b></span></div>
-                <div className="kv"><span>Order blocks (active / mitigated / violated)</span><span><b>{ict.orderBlocks.filter((o) => o.state === 'active').length} / {ict.orderBlocks.filter((o) => o.state === 'mitigated').length} / {ict.orderBlocks.filter((o) => o.state === 'violated').length}</b></span></div>
-                <div className="kv"><span>Breaker blocks</span><span><b>{ict.breakers.length}</b></span></div>
-                <div className="kv"><span>FVG (open / partial / filled)</span><span><b>{ict.fvgs.filter((g) => g.state === 'unfilled').length} / {ict.fvgs.filter((g) => g.state === 'partial').length} / {ict.fvgs.filter((g) => g.state === 'filled').length}</b></span></div>
-                <h2 style={{ marginTop: 12, fontSize: 14 }}>⚡ Latest structure events</h2>
-                {(ict.events.slice(-8).reverse().length === 0) && <p className="sub">No BOS / sweep in the recent window — chop or slow grind.</p>}
-                {ict.events.slice(-8).reverse().map((e, i) => (
-                  <div className="reason" key={i}>
-                    <span className={`dot ${e.direction === 1 ? 'bull' : 'bear'}`} />
-                    <div><b>{e.label}</b><p>bar #{e.index} · {new Date(candles[e.index]?.timestamp).toLocaleString()}</p></div>
-                    <span className="pts">{e.direction === 1 ? '+4' : '−4'}</span>
-                  </div>
-                ))}
-                {ict.breakers.slice(-4).reverse().map((b, i) => (
-                  <div className="kv" key={'br' + i}><span>🧱 {b.label}</span><span>bar #{b.index}</span></div>
-                ))}
-                {ict.orderBlocks.slice(-4).reverse().map((o, i) => (
-                  <div className="kv" key={'ob' + i}><span>{o.direction === 1 ? '🟩' : '🟥'} {o.label}</span><span>bar #{o.index}</span></div>
-                ))}
-                {ict.fvgs.slice(-4).reverse().map((g, i) => (
-                  <div className="kv" key={'fvg' + i}><span>{g.direction === 1 ? '📈' : '📉'} {g.label}</span><span>bar #{g.index}</span></div>
-                ))}
+                <IctPanel ict={ict} candles={candles} asset={asset} />
               </div>
             </div>
 
             <div className="card" style={{ marginTop: 16 }}>
-              <h2>📜 Trades ({result.trades.length})</h2>
-              <p className="sub">Newest first · costs already deducted · R-multiples implied by ATR stop/target</p>
-              <div className="tbl-wrap">
-                <table>
-                  <thead><tr><th>Entry → Exit</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Net</th><th>Ret%</th><th>Reason</th><th>Held</th></tr></thead>
-                  <tbody>
-                    {[...result.trades].reverse().slice(0, 80).map((t, i) => (
-                      <tr key={i}>
-                        <td>{new Date(t.entryTime).toLocaleDateString()} → {new Date(t.exitTime).toLocaleDateString()}</td>
-                        <td><span className={t.dir === 1 ? 'long-tag' : 'short-tag'}>{t.dir === 1 ? 'LONG' : 'SHORT'}</span></td>
-                        <td>{fmtPrice(t.entry, asset.decimals)}</td>
-                        <td>{fmtPrice(t.exit, asset.decimals)}</td>
-                        <td className={t.net > 0 ? 'pos' : 'neg'}>{money(t.net)}</td>
-                        <td className={t.net > 0 ? 'pos' : 'neg'}>{t.retPct.toFixed(2)}%</td>
-                        <td>{t.reason}</td>
-                        <td>{t.barsHeld} bars</td>
-                      </tr>
-                    ))}
-                    {result.trades.length === 0 && <tr><td colSpan={8} style={{ textAlign: 'center' }}>No trades — the strategy never triggered on this window. Try another strategy or timeframe.</td></tr>}
-                  </tbody>
-                </table>
-              </div>
+              <TradesTable trades={result.trades} decimals={asset.decimals} />
             </div>
 
             <div className="card" style={{ marginTop: 16 }}>
@@ -918,6 +994,9 @@ export default function App() {
           </>
         )}
 
+        </>
+        )}
+
         {/* HYPERLIQUID META */}
         <div className="card" style={{ marginTop: 16 }}>
           <h2>⚡ Hyperliquid adapter — Hyperliquid-only mode</h2>
@@ -945,65 +1024,12 @@ export default function App() {
           <a href="#signals">🤖<span>Signals</span></a>
           <button onClick={() => { setView('learn'); setTimeout(() => document.getElementById('signals')?.scrollIntoView({ behavior: 'smooth' }), 60); }}>🎓<span>Learn</span></button>
         </nav>
-      </div>
-    </div>
-  );
-}
-
-function RiskCalc({ asset, levels, lastClose, balance, model, onModel }) {
-  const [bal, setBal] = useState(balance || 10000);
-  const [riskPct, setRiskPct] = useState(1);
-  const [entry, setEntry] = useState(null);
-  const [sl, setSl] = useState(null);
-  const [tp, setTp] = useState(null);
-  const [lev, setLev] = useState(1);
-  const e = entry ?? lastClose ?? levels?.entry ?? 0;
-  const s = sl ?? levels?.stop ?? 0;
-  const t = tp ?? levels?.takeProfit ?? 0;
-  const dir = e > s ? 1 : -1;
-  const stopDist = Math.abs(e - s);
-  const tpDist = Math.abs(t - e);
-  const maxLoss = bal * (riskPct / 100);
-  const qty = stopDist > 0 ? maxLoss / stopDist : 0;
-  const notional = qty * e;
-  const margin = lev > 0 ? notional / lev : notional;
-  const profit = tpDist * qty;
-  const rr = stopDist > 0 ? tpDist / stopDist : 0;
-  const liq = lev > 1 && e ? liquidationPrice(model || 'isolated-simple', e, dir, lev) : null;
-  const liqClose = liq != null && stopDist > 0 && Math.abs(e - liq) < stopDist * 1.5;
-  return (
-    <div>
-      <h2>🧮 Risk Calculator</h2>
-      <p className="sub">Size from risk, not from hope. Prefilled from SignalBot levels.</p>
-      <div className="row2">
-        <div><label className="lbl">Account ($)</label><input type="number" value={bal} onChange={(ev) => setBal(Number(ev.target.value) || 0)} /></div>
-        <div><label className="lbl">Risk (%)</label><input type="number" step="0.25" value={riskPct} onChange={(ev) => setRiskPct(Number(ev.target.value) || 0)} /></div>
-      </div>
-      <div className="row2">
-        <div><label className="lbl">Entry</label><input type="number" value={e || ''} onChange={(ev) => setEntry(Number(ev.target.value) || 0)} /></div>
-        <div><label className="lbl">Stop loss</label><input type="number" value={s || ''} onChange={(ev) => setSl(Number(ev.target.value) || 0)} /></div>
-      </div>
-      <div className="row2">
-        <div><label className="lbl">Take profit</label><input type="number" value={t || ''} onChange={(ev) => setTp(Number(ev.target.value) || 0)} /></div>
-        <div><label className="lbl">Leverage (×)</label><input type="number" min="1" max="50" value={lev} onChange={(ev) => setLev(Math.min(50, Math.max(1, Number(ev.target.value) || 1)))} /></div>
-      </div>
-      <div className="kv"><span>Maximum risk</span><span><b>{money(maxLoss)}</b></span></div>
-      <div className="kv"><span>Position size</span><span><b>{qty.toFixed(4)} {asset?.symbol}</b> (${notional.toLocaleString(undefined, { maximumFractionDigits: 0 })} notional)</span></div>
-      <div className="kv"><span>Margin used</span><span><b>${margin.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b></span></div>
-      <div className="kv"><span>Potential profit</span><span className="pos"><b>{money(profit)}</b></span></div>
-      <div className="kv"><span>Risk / reward</span><span><b>1 : {rr.toFixed(2)}</b></span></div>
-      {liq != null && (
-        <div className="alert" style={liqClose ? { borderColor: 'rgba(251,113,133,.5)', background: 'rgba(251,113,133,.1)', marginTop: 8 } : { marginTop: 8 }}>
-          {liqClose ? '🚨 Liquidation warning' : 'ℹ️ Liquidation'} — {liqLabel(model || 'isolated-simple')}: ~{fmtPrice(liq, asset?.decimals)}{liqClose ? ', uncomfortably close to your stop. Lower leverage.' : ', safely beyond your stop.'}
-        </div>
-      )}
-      <div className="row2" style={{ marginTop: 8 }}>
-        <div><label className="lbl">Liquidation model</label>
-          <select value={model || 'isolated-simple'} onChange={(e) => onModel && onModel(e.target.value)}>
-            <option value="isolated-simple">Isolated (simplified)</option>
-            <option value="hyperliquid">Hyperliquid-style (≈)</option>
-          </select>
-        </div>
+        <button
+          className={`to-top${showTop ? ' show' : ''}`}
+          onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+          aria-label="Scroll to top"
+          title="Back to top"
+        >↑</button>
       </div>
     </div>
   );
@@ -1135,12 +1161,32 @@ function StaticHelp() {
 function norm(s) {
   return String(s || '').toLowerCase().replace(/[\s/_.\-]/g, '');
 }
+function isoDay(ts) {
+  return new Date(ts).toISOString().slice(0, 10);
+}
 function stripQuote(s) {
   return s.replace(/(usdt|usdc|fdusd|busd|tusd|dai|btc|eth|bnb)$/, '');
 }
 
 function Stat({ k, v, c }) {
   return (<div className="stat"><div className="k">{k}</div><div className={`v ${c || 'flat'}`}>{v}</div></div>);
+}
+
+const NAV = [
+  ['lab', '🧪', 'Lab'],
+  ['signals', '🎯', 'Signals']
+];
+
+function TopNav({ page, setPage }) {
+  return (
+    <nav className="topnav" aria-label="Sections">
+      {NAV.map(([id, icon, label]) => (
+        <button key={id} className={page === id ? 'on' : ''} onClick={() => { setPage(id); window.scrollTo({ top: 0 }); }}>
+          <span className="ni">{icon}</span><span className="nl">{label}</span>
+        </button>
+      ))}
+    </nav>
+  );
 }
 function money(v) {
   const s = v < 0 ? '−$' : '$';

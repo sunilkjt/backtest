@@ -8,7 +8,7 @@ export const DEFAULT_OVERLAYS = {
 
 // Cartoon-styled canvas candlestick chart with toggleable indicator,
 // trade-marker, ICT and plan-level overlays.
-export default function CandleChart({ candles, ind, trades = [], ict = null, height = 380, overlays = DEFAULT_OVERLAYS, levels = null }) {
+export default function CandleChart({ candles, ind, trades = [], ict = null, height = 380, overlays = DEFAULT_OVERLAYS, levels = null, focus = null }) {
   const ref = useRef(null);
   const tipRef = useRef(null);
   const ov = { ...DEFAULT_OVERLAYS, ...(overlays || {}) };
@@ -252,12 +252,14 @@ export default function CandleChart({ candles, ind, trades = [], ict = null, hei
       }
     }
 
-    // trade plan levels (entry/SL/TP from SignalBot)
+    // trade plan levels (entry/SL/TP from SignalBot; supports targets array)
     if (ov.levels && levels) {
       const plan = [
         { v: levels.entry, c: '#22d3ee', t: 'ENTRY' },
         { v: levels.stop, c: '#fb7185', t: 'SL' },
-        { v: levels.takeProfit, c: '#34d399', t: 'TP' }
+        ...(Array.isArray(levels.targets)
+          ? levels.targets.map((tg, k) => ({ v: tg.price, c: '#34d399', t: tg.key || `T${k + 1}` }))
+          : [{ v: levels.takeProfit, c: '#34d399', t: 'TP' }])
       ];
       ctx.font = 'bold 10px system-ui';
       for (const p of plan) {
@@ -292,6 +294,14 @@ export default function CandleChart({ candles, ind, trades = [], ict = null, hei
       }
     }
 
+    // focused bar highlight (click-to-inspect from ICT/FVG/OB panels)
+    if (focus != null && focus >= 0 && focus < n) {
+      ctx.fillStyle = 'rgba(34,211,238,0.10)';
+      ctx.fillRect(x(focus) - cw / 2, padT, cw, priceH);
+      ctx.strokeStyle = '#22d3ee'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x(focus), y(candles[focus].close), 7, 0, Math.PI * 2); ctx.stroke();
+    }
+
     // last price line
     const last = candles[n - 1].close;
     ctx.strokeStyle = n > 1 && last >= candles[n - 2]?.close ? 'rgba(52,211,153,0.7)' : 'rgba(251,113,133,0.7)';
@@ -320,7 +330,7 @@ export default function CandleChart({ candles, ind, trades = [], ict = null, hei
     const onLeave = () => { if (tipRef.current) tipRef.current.style.display = 'none'; };
     canvas.onmousemove = onMove;
     canvas.onmouseleave = onLeave;
-  }, [candles, ind, trades, ict, height, overlays, levels]);
+  }, [candles, ind, trades, ict, height, overlays, levels, focus]);
 
   return (
     <div style={{ position: 'relative' }}>

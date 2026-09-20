@@ -56,8 +56,7 @@ describe('§13 backtest invariant (prefix == full up to T)', () => {
       assertPrefixInvariant(candles, 300, ALL_IDS, `demo-${sym}@300`);
     }
   });
-  it('holds with leverage + params active', () => {
-    const candles = generateDemoCandles('SOL', '1h', 400);
+  it('holds with leverage + params active', () => {    const candles = generateDemoCandles('SOL', '1h', 400);
     const T = 250;
     const prefix = candles.slice(0, T);
     const iP = computeAll(prefix), iF = computeAll(candles);
@@ -122,5 +121,48 @@ describe('§12 targeted futures (prefix must stay blind)', () => {
     const T = candles.length; // 40: range only, levels of the future unknown
     for (const p of [104, 108, 112, 111, 110, 109, 108, 107]) candles.push(C(t += 36e5, p - 1, p + 0.5, p - 1.5, p));
     assertPrefixInvariant(candles, T, ALL_IDS, 'bos-future');
+  });
+});
+
+describe('§36 large-scale prefix invariance (700 of 1000)', () => {
+  it('indicators, ICT engine states, signals and backtests match through bar 700', async () => {
+    const { stateAt, causalFor } = await import('../src/lib/ictEngine.js');
+    const candles = generateDemoCandles('BTC', '1h', 1000);
+    const T = 700;
+    const prefix = candles.slice(0, T);
+    const indPre = computeAll(prefix);
+    const indFull = computeAll(candles);
+    // indicators: trailing values identical on the shared window
+    for (const k of ['ema20', 'ema50', 'rsi', 'atr', 'macdLine', 'bbUpper', 'stDir', 'adx']) {
+      for (const i of [100, 300, 500, 699]) {
+        const a = indPre[k][i], b = indFull[k][i];
+        if (a == null || b == null) { assert.equal(a, b, `${k}@${i}`); continue; }
+        assert.ok(Math.abs(a - b) < 1e-9, `${k}@${i} diverged`);
+      }
+    }
+    // causal ICT states identical bar-for-bar
+    const engPre = causalFor(prefix);
+    const engFull = causalFor(candles);
+    for (const i of [100, 300, 500, 699]) {
+      assert.deepEqual(stateAt(engPre, i), stateAt(engFull, i), `causal state at ${i} diverged`);
+    }
+    // strategies + backtests
+    assertPrefixInvariant(candles, T, ALL_IDS, 'big-700');
+  });
+  it('invariant holds in both execution modes', () => {
+    const candles = generateDemoCandles('ETH', '1h', 400);
+    const T = 250;
+    for (const execution of ['open', 'close']) {
+      const prefix = candles.slice(0, T);
+      const iP = computeAll(prefix), iF = computeAll(candles);
+      for (const id of ['ema-rsi', 'ict-fvg', 'ict-ob', 'smc-bos', 'sma-cross']) {
+        const a = runBacktest(prefix, iP, id, { initialCapital: 10000, execution }, {});
+        const b = runBacktest(candles, iF, id, { initialCapital: 10000, execution }, {});
+        const ca = a.trades.filter((t) => t.exitIndex < T - 1);
+        const cb = b.trades.filter((t) => t.exitIndex < T - 1);
+        assert.equal(ca.length, cb.length, `${id}/${execution}: count diverged`);
+        for (let k = 0; k < ca.length; k++) assert.equal(ca[k].exit, cb[k].exit, `${id}/${execution}: exit diverged`);
+      }
+    }
   });
 });

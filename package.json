@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test tests/indicators.test.mjs tests/backtest.test.mjs tests/ict-scores.test.mjs tests/lookahead.test.mjs tests/causal.test.mjs"
+    "test": "node --test tests/indicators.test.mjs tests/backtest.test.mjs tests/ict-scores.test.mjs tests/lookahead.test.mjs tests/causal.test.mjs tests/setup.test.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",
