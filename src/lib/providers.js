@@ -92,6 +92,26 @@ export class HyperliquidProvider extends MarketDataProvider {
     return null;
   }
 
+  // Best-effort perp funding history for cost-accurate backtests.
+  // Returns [{timestamp, rate}] or null when unavailable (never throws).
+  async getFunding({ ref, startTime, endTime }) {
+    try {
+      const data = await fetchJson(this.endpoint(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'fundingHistory', coin: ref, startTime, endTime })
+      }, 20000);
+      const rows = Array.isArray(data) ? data : [];
+      const out = rows.map((r) => ({
+        timestamp: r.time ?? r.timestamp ?? r.t,
+        rate: parseFloat(r.fundingRate ?? r.rate ?? r.f)
+      })).filter((f) => Number.isFinite(f.timestamp) && Number.isFinite(f.rate));
+      return out.length ? out : null;
+    } catch {
+      return null;
+    }
+  }
+
   async getCandles({ ref, timeframe, limit = 300 }) {
     const interval = HL_INTERVAL[timeframe];
     if (!interval) throw new Error(UNAVAILABLE);

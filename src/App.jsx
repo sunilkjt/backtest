@@ -1,31 +1,51 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Robot from './components/Robot.jsx';
-import CandleChart from './components/CandleChart.jsx';
+import CandleChart, { OscillatorPanel, OverlayToggles, DEFAULT_OVERLAYS } from './components/CandleChart.jsx';
 import EquityChart from './components/EquityChart.jsx';
 import { MARKETS, TIMEFRAMES, ASSETS, assetsForMarket } from './lib/assets.js';
 import { providerForMarket, UNAVAILABLE } from './lib/providers.js';
 import { computeAll } from './lib/indicators.js';
 import { STRATEGIES, getStrategy } from './lib/strategies.js';
-import { runBacktest, compareAll, DEFAULT_RISK } from './lib/backtest.js';
+import { runBacktest, compareSelected, walkForward, overfitWarnings, DEFAULT_RISK } from './lib/backtest.js';
 import { analyzeICT } from './lib/ict.js';
-import { buildSignal } from './lib/signals.js';
+import { buildSignal, DEFAULT_WEIGHTS } from './lib/signals.js';
+import { detectRegime, tradeLevels, dayChange } from './lib/scores.js';
 import { generateDemoCandles } from './lib/demo.js';
-import { tradesToCsv, download, summaryText } from './lib/export.js';
+import { tradesToCsv, signalsToCsv, strategyToJson, analysisReport, download, summaryText } from './lib/export.js';
+
+// Persisted user state (localStorage).
+const LS_KEY = 'ai-trading-lab:v1';
+function loadLS() {
+  try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch { return {}; }
+}
 
 export default function App() {
-  const [market, setMarket] = useState('crypto');
-  const [symbol, setSymbol] = useState('BTC');
-  const [timeframe, setTimeframe] = useState('1h');
-  const [strategyId, setStrategyId] = useState('ema-rsi');
-  const [limit, setLimit] = useState(300);
-  const [risk, setRisk] = useState(DEFAULT_RISK);
+  const ls = useMemo(loadLS, []);
+  const [market, setMarket] = useState(ls.market || 'crypto');
+  const [symbol, setSymbol] = useState(ls.symbol || 'BTC');
+  const [timeframe, setTimeframe] = useState(ls.timeframe || '1h');
+  const [strategyId, setStrategyId] = useState(ls.strategyId || 'ema-rsi');
+  const [limit, setLimit] = useState(ls.limit || 300);
+  const [risk, setRisk] = useState({ ...DEFAULT_RISK, ...(ls.risk || {}) });
+  const [weights, setWeights] = useState(ls.weights || DEFAULT_WEIGHTS);
+  const [overlays, setOverlays] = useState({ ...DEFAULT_OVERLAYS, ...(ls.overlays || {}) });
+  const [showOsc, setShowOsc] = useState(ls.showOsc || { rsi: true, macd: false });
+  const [favorites, setFavorites] = useState(ls.favorites || []);
+  const [dateRange, setDateRange] = useState({ from: '', to: '' });
+  const [useFunding, setUseFunding] = useState(false);
   const [demoMode, setDemoMode] = useState(false);
-  const [candles, setCandles] = useState([]);
+  const [rawCandles, setRawCandles] = useState([]);
+  const [funding, setFunding] = useState(null);
   const [source, setSource] = useState('live');
   const [loading, setLoading] = useState(false);
+  const [stage, setStage] = useState('');
   const [error, setError] = useState('');
   const [price, setPrice] = useState(null);
   const [compared, setCompared] = useState(null);
+  const [compareIds, setCompareIds] = useState(ls.compareIds || STRATEGIES.map((s) => s.id));
+  const [wf, setWf] = useState(null);
+  const [mtf, setMtf] = useState(null);
+  const [mtfLoading, setMtfLoading] = useState(false);
   const [view, setView] = useState('lab'); // 'lab' | 'learn' — separate beginner tab
   const [hlCoins, setHlCoins] = useState([]);
   const [query, setQuery] = useState('');
@@ -103,38 +123,75 @@ export default function App() {
       || assetsForMarket(m)[0];
   }, [knownAssets, extras]);
 
+  // Persist workspace (favorites, strategies, prefs, risk config).
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify({
+        market, symbol, timeframe, strategyId, limit, risk, weights,
+        overlays, showOsc, favorites, compareIds
+      }));
+    } catch { /* storage full/blocked — lab still works */ }
+  }, [market, symbol, timeframe, strategyId, limit, risk, weights, overlays, showOsc, favorites, compareIds]);
+
+  const tick = () => new Promise((r) => setTimeout(r, 30));
+
   const fetchData = useCallback(async (opts = {}) => {
     const m = opts.market ?? market;
     const sym = opts.symbol ?? symbol;
     const tf = opts.timeframe ?? timeframe;
     const lim = opts.limit ?? limit;
     const useDemo = opts.demoMode ?? demoMode;
+    const riskNow = opts.risk ?? risk;
+    const fundNow = opts.useFunding ?? useFunding;
     const a = resolveAsset(m, sym, opts.asset);
     if (!a) return;
     setLoading(true);
     setError('');
     setCompared(null);
+    setWf(null);
+    setMtf(null);
     try {
       if (useDemo) {
+        setStage('Simulating demo candles…');
         await new Promise((r) => setTimeout(r, 350));
-        setCandles(generateDemoCandles(a.symbol, tf, lim));
+        setRawCandles(generateDemoCandles(a.symbol, tf, lim));
+        setFunding(null);
         setSource('demo');
         setPrice(null);
       } else {
+        setStage(`Downloading ${a.symbol} ${tf} from ${providerForMarket(m).label}…`);
+        await tick();
         const provider = providerForMarket(m);
         const data = await provider.getCandles({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo, timeframe: tf, limit: lim });
-        setCandles(data);
+        setStage('Calculating indicators…');
+        await tick();
+        setRawCandles(data);
+        setStage('Detecting market structure…');
+        await tick();
+        // Perp funding (Hyperliquid only, opt-in): applied as a holding cost.
+        if (fundNow && m === 'hyperliquid' && provider.getFunding && data.length > 1) {
+          try {
+            const fr = await provider.getFunding({ ref: a.ref, startTime: data[0].timestamp, endTime: data[data.length - 1].timestamp });
+            setFunding(fr);
+          } catch { setFunding(null); }
+        } else {
+          setFunding(null);
+        }
         setSource('live');
         provider.getPrice({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo }).then(setPrice).catch(() => {});
       }
+      setStage('Running backtest…');
+      await tick();
     } catch (e) {
-      setCandles([]);
+      setRawCandles([]);
+      setFunding(null);
       setPrice(null);
       setError(e?.message || UNAVAILABLE);
     } finally {
+      setStage('');
       setLoading(false);
     }
-  }, [market, symbol, timeframe, limit, demoMode, resolveAsset]);
+  }, [market, symbol, timeframe, limit, demoMode, risk, useFunding, resolveAsset]);
 
   useEffect(() => { fetchData({}); }, []); // auto-run on load
   useEffect(() => {
@@ -207,33 +264,116 @@ export default function App() {
     setTimeout(() => fetchData({ symbol: a.symbol, asset: a }), 0);
   };
 
+  // Date-range window: all downstream math (indicators → backtest) uses this slice,
+  // so chart indices, trades and equity always agree.
+  const candles = useMemo(() => {
+    const from = dateRange.from ? Date.parse(dateRange.from) : 0;
+    const to = dateRange.to ? Date.parse(dateRange.to) + 864e5 - 1 : Infinity;
+    if (!from && to === Infinity) return rawCandles;
+    return rawCandles.filter((c) => c.timestamp >= from && c.timestamp <= to);
+  }, [rawCandles, dateRange]);
+
+  const riskEff = useMemo(() => ({ ...risk, funding: useFunding ? funding : null }), [risk, funding, useFunding]);
   const ind = useMemo(() => (candles.length ? computeAll(candles) : null), [candles]);
   const ict = useMemo(() => (candles.length ? analyzeICT(candles) : null), [candles]);
   const signal = useMemo(
-    () => (candles.length && ind ? buildSignal(candles, ind, ict) : null),
-    [candles, ind, ict]
+    () => (candles.length && ind ? buildSignal(candles, ind, ict, weights) : null),
+    [candles, ind, ict, weights]
   );
   const result = useMemo(
-    () => (candles.length && ind ? runBacktest(candles, ind, strategyId, risk) : null),
-    [candles, ind, strategyId, risk]
+    () => (candles.length && ind ? runBacktest(candles, ind, strategyId, riskEff) : null),
+    [candles, ind, strategyId, riskEff]
   );
   const strategy = getStrategy(strategyId);
   const lastClose = candles.length ? candles[candles.length - 1].close : null;
+  const regime = useMemo(() => (candles.length && ind ? detectRegime(candles, ind) : null), [candles, ind]);
+  const levels = useMemo(
+    () => (candles.length && ind && signal && signal.direction !== 'NEUTRAL'
+      ? tradeLevels(candles, ind, ict, signal.direction, riskEff) : null),
+    [candles, ind, ict, signal, riskEff]
+  );
+  const chg24 = useMemo(() => dayChange(candles), [candles]);
+  const wfWarnings = useMemo(() => {
+    if (!result) return [];
+    const oos = wf?.oos?.stats || null;
+    return overfitWarnings(result.stats, oos, riskEff);
+  }, [result, wf, riskEff]);
+  const ovTradesForChart = useMemo(() => (overlays.trades && result ? result.trades : []), [overlays.trades, result]);
 
   const runCompare = () => {
     if (!candles.length || !ind) return;
-    setCompared(compareAll(candles, ind, risk));
+    const ids = compareIds.length ? compareIds : STRATEGIES.map((s) => s.id);
+    setCompared(compareSelected(candles, ind, ids, riskEff));
   };
+
+  const runWalkForward = () => {
+    if (candles.length < 120 || !ind) return;
+    setWf(walkForward(candles, strategyId, riskEff, 0.7, 200));
+  };
+
+  const runMtf = async () => {
+    if (!asset) return;
+    setMtfLoading(true);
+    try {
+      const tfs = ['15m', '1h', '4h', '1d'];
+      const rows = [];
+      for (const tf of tfs) {
+        try {
+          let data;
+          if (source === 'demo') {
+            data = generateDemoCandles(asset.symbol, tf, 220);
+          } else {
+            const provider = providerForMarket(market);
+            data = await provider.getCandles({ symbol: asset.symbol, ref: asset.ref, yahoo: asset.yahoo, timeframe: tf, limit: 220 });
+          }
+          const ii = computeAll(data);
+          const ic = analyzeICT(data);
+          const sg = buildSignal(data, ii, ic, weights);
+          rows.push({ tf, direction: sg.direction, score: sg.score, tech: sg.tech.score, ict: sg.ictS.score, ok: true });
+        } catch {
+          rows.push({ tf, ok: false });
+        }
+      }
+      setMtf(rows);
+    } finally {
+      setMtfLoading(false);
+    }
+  };
+
+  const toggleFav = () => {    if (!asset) return;
+    const key = market + '|' + asset.symbol;
+    setFavorites((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+  };
+  const favKey = asset ? market + '|' + asset.symbol : '';
+  const isFav = favorites.includes(favKey);
 
   const doExportCsv = () => {
     if (!result) return;
     download(`${asset.symbol}-${timeframe}-${strategyId}-trades.csv`, tradesToCsv(result.trades), 'text/csv');
   };
+  const doExportSignals = () => {
+    if (!signal) return;
+    download(`${asset.symbol}-${timeframe}-signals.csv`, signalsToCsv(signal), 'text/csv');
+  };
+  const doExportStrategy = () => {
+    download(`${strategyId}-strategy.json`, strategyToJson(
+      { id: strategy.id, name: strategy.name, tagline: strategy.tagline, description: strategy.description, params: strategy.params, entry: strategy.entry, exit: strategy.exit },
+      riskEff, weights
+    ), 'application/json');
+  };
+  const doExportReport = () => {
+    if (!result || !signal) return;
+    download(`${asset.symbol}-${timeframe}-report.md`, analysisReport({
+      asset: asset.symbol, market, timeframe, strategy: strategy.name,
+      stats: result.stats, signal, tech: signal.tech, ictS: signal.ictS,
+      regime: regime || { label: '—', detail: '' }, levels, source
+    }), 'text/markdown');
+  };
   const doExportJson = () => {
     if (!result) return;
     download(`${asset.symbol}-${timeframe}-${strategyId}-result.json`, JSON.stringify({
       asset: asset.symbol, market, timeframe, strategy: strategyId, source,
-      risk, stats: result.stats, signal, trades: result.trades
+      risk: riskEff, weights, stats: result.stats, signal, trades: result.trades
     }, null, 2), 'application/json');
   };
   const doCopy = async () => {
@@ -247,30 +387,37 @@ export default function App() {
     <div className="stars">
       <div className="wrap">
         {/* HERO */}
-        <header className="hero">
+        <header className="hero" id="home">
           <div className="robot-wrap"><Robot mood={signal?.direction} /></div>
           <div>
             <h1>🤖 <span className="grad">AI Trading Lab</span></h1>
             <p className="tagline"><b>Test. Analyze. Understand. Trade Smarter.</b> — a browser laboratory that backtests real market data, explains every signal, and shows its work. No black boxes.</p>
             <div className="badges">
-              <span className="badge">⚗️ 8 rule-based strategies</span>
+              <span className="badge">⚗️ {STRATEGIES.length} rule-based strategies</span>
               <span className="badge">📊 Real backtest engine</span>
               <span className="badge">🧠 ICT / SMC lab</span>
               <span className={source === 'live' ? 'badge live' : 'badge demo'}>{source === 'live' ? '● LIVE market data' : '● DEMO · simulated data'}</span>
               {asset && <span className="badge">🔗 {providerForMarket(market).label}</span>}
+              {regime && candles.length > 0 && <span className="badge">{regime.emoji} {regime.label}</span>}
             </div>
             <div className="price-pill">
               <span className="pulse" />
               <b>{asset?.symbol} / {timeframe}</b>
               <span>{lastClose != null ? fmtPrice(lastClose, asset?.decimals) : '—'}</span>
+              {chg24 != null && (
+                <span style={{ color: chg24 >= 0 ? '#34d399' : '#fb7185', fontWeight: 800 }}>
+                  {chg24 >= 0 ? '▲' : '▼'} {Math.abs(chg24).toFixed(2)}% / 24h
+                </span>
+              )}
               {price != null && source === 'live' && <span style={{ color: '#9aa6d0' }}>· live {fmtPrice(price, asset?.decimals)}</span>}
               {candles.length > 0 && <span style={{ color: '#9aa6d0' }}>· {candles.length} candles</span>}
+              <button className="chip" onClick={toggleFav} title="Save to favorites (persisted)" style={{ marginLeft: 4 }}>{isFav ? '★ Fav' : '☆ Fav'}</button>
             </div>
           </div>
         </header>
 
         {/* CONTROL DECK */}
-        <div className="grid deck">
+        <div className="grid deck" id="markets">
           <div className="card span4">
             <h2>1️⃣ Market & Asset</h2>
             <p className="sub">Pick a laboratory bench. Hyperliquid serves perps; others serve spot / cash.</p>
@@ -313,6 +460,21 @@ export default function App() {
               </button>
             )}
             <p className="sub" style={{ marginTop: 10 }}>Tip: spaces and “/” are ignored — “op usdt”, “op/usdt” and “opusdt” all find OP.</p>
+            {favorites.length > 0 && (
+              <div>
+                <label className="lbl">★ Favorites (saved on this device)</label>
+                <div className="seg">
+                  {favorites.map((k) => {
+                    const [fm, fs] = k.split('|');
+                    return (<button key={k} className="chip" title={`Load ${fs} on ${fm}`} onClick={() => {
+                      const fa = [...ASSETS, ...customs].find((x) => x.market === fm && x.symbol === fs) || assetsForMarket(fm).find((x) => x.symbol === fs);
+                      setMarket(fm); setSymbol(fs); setQuery(''); setCompared(null);
+                      setTimeout(() => fetchData({ market: fm, symbol: fs, asset: fa }), 0);
+                    }}>{fm === market && fs === symbol ? '● ' : ''}{fs}</button>);
+                  })}
+                </div>
+              </div>
+            )}
             <p className="sub" style={{ marginTop: 10 }}>{asset?.name} · feed <code>{asset?.yahoo || asset?.ref}</code></p>
           </div>
 
@@ -330,9 +492,22 @@ export default function App() {
               {STRATEGIES.map((s) => (<option key={s.id} value={s.id}>{s.name} — {s.tagline}</option>))}
             </select>
             <p className="sub" style={{ marginTop: 8 }}>{strategy.description}</p>
+            <div className="kv"><span>Entry</span><span style={{ textAlign: 'right', maxWidth: '65%' }}>{strategy.entry}</span></div>
+            <div className="kv"><span>Exit</span><span style={{ textAlign: 'right', maxWidth: '65%' }}>{strategy.exit}</span></div>
+            {(strategy.params || []).length > 0 && (
+              <p className="sub" style={{ marginTop: 6 }}>Defaults: {strategy.params.map((p) => `${p.label} ${p.def}`).join(' · ')}</p>
+            )}
             <label className="lbl">Candles (50–1000)</label>
             <input type="range" min={50} max={1000} step={10} value={limit} onChange={(e) => setLimit(Number(e.target.value))} />
             <div className="kv"><span>History length</span><span><b>{limit}</b> candles</span></div>
+            <label className="lbl">Date range (optional backtest window)</label>
+            <div className="row2">
+              <div><input type="date" value={dateRange.from} onChange={(e) => setDateRange({ ...dateRange, from: e.target.value })} /></div>
+              <div><input type="date" value={dateRange.to} onChange={(e) => setDateRange({ ...dateRange, to: e.target.value })} /></div>
+            </div>
+            {(dateRange.from || dateRange.to) && (
+              <div className="toolbar"><button className="btn ghost" onClick={() => setDateRange({ from: '', to: '' })}>Clear dates ({candles.length} in window)</button></div>
+            )}
           </div>
 
           <div className="card span4">
@@ -350,11 +525,16 @@ export default function App() {
               <div><label className="lbl">Stop = ATR ×</label><input type="number" step="0.5" value={risk.stopAtrMult} onChange={(e) => setRisk({ ...risk, stopAtrMult: Number(e.target.value) || 2 })} /></div>
               <div><label className="lbl">Take-profit RR</label><input type="number" step="0.5" value={risk.takeProfitRR} onChange={(e) => setRisk({ ...risk, takeProfitRR: Number(e.target.value) || 2 })} /></div>
             </div>
+            <div className="row2">
+              <div><label className="lbl">Leverage (×)</label><input type="number" step="1" min="1" max="50" value={risk.leverage || 1} onChange={(e) => setRisk({ ...risk, leverage: Math.min(50, Math.max(1, Number(e.target.value) || 1)) })} /></div>
+              <div><label className="lbl">Score: technical %</label><input type="number" step="5" min="0" max="100" value={weights.technical} onChange={(e) => { const t = Math.min(100, Math.max(0, Number(e.target.value) || 60)); setWeights({ technical: t, ict: 100 - t }); }} /></div>
+            </div>
             <label className="toggle"><input type="checkbox" checked={risk.allowShort} onChange={(e) => setRisk({ ...risk, allowShort: e.target.checked })} /> Allow short positions</label>
+            <label className="toggle"><input type="checkbox" checked={useFunding} onChange={(e) => { setUseFunding(e.target.checked); setTimeout(() => fetchData({ useFunding: e.target.checked }), 0); }} /> Apply Hyperliquid perp funding as holding cost</label>
             <label className="toggle"><input type="checkbox" checked={demoMode} onChange={(e) => { setDemoMode(e.target.checked); setTimeout(() => fetchData({ demoMode: e.target.checked }), 0); }} /> Use clearly-labelled <b>&nbsp;demo data&nbsp;</b> (offline / testing)</label>
             <div className="toolbar">
               <button className="btn" disabled={loading} onClick={() => fetchData({})}>{loading ? '⚗️ Brewing data…' : '🧪 Fetch & Backtest'}</button>
-              <button className="btn ghost" onClick={runCompare} disabled={!candles.length}>⚔️ Compare all</button>
+              <button className="btn ghost" onClick={runCompare} disabled={!candles.length}>⚔️ Compare selected</button>
             </div>
           </div>
         </div>
@@ -362,7 +542,7 @@ export default function App() {
         {/* STATUS */}
         {loading && (
           <div className="card" style={{ marginTop: 16 }}>
-            <div className="loading-robot"><span className="spin" /> The robot is pipetting <b>&nbsp;{asset?.symbol} {timeframe}&nbsp;</b> candles from <b>&nbsp;{providerForMarket(market).label}&nbsp;</b>…</div>
+            <div className="loading-robot"><span className="spin" /> {stage || `The robot is pipetting ${asset?.symbol} ${timeframe} candles…`}</div>
           </div>
         )}
         {error && !loading && (
@@ -383,14 +563,55 @@ export default function App() {
         {/* RESULTS */}
         {signal && result && !loading && !error && (
           <>
-            <div className="card span12" style={{ marginTop: 16 }}>
+            <div className="card span12" style={{ marginTop: 16 }} id="signals">
               <div className="signal-banner">
                 <div className={`signal-badge ${signal.direction}`}>{signal.direction === 'BUY' ? '▲ BUY' : signal.direction === 'SELL' ? '▼ SELL' : '● HOLD'}<small>{signal.score}/100 · {signal.confidence}</small></div>
                 <div>
-                  <h2 style={{ margin: '0 0 6px' }}>🔬 Signal Lab — {asset.symbol} · {timeframe} · {strategy.name}</h2>
-                  <p className="sub">Confluence of {signal.reasons.length} transparent checks · 🟢 {signal.bull} bull pts vs 🔴 {signal.bear} bear pts (net {signal.net >= 0 ? '+' : ''}{signal.net}) · {source === 'live' ? 'LIVE data' : 'DEMO data'}</p>
+                  <h2 style={{ margin: '0 0 6px' }}>🤖 SignalBot — {asset.symbol} · {timeframe} · {strategy.name}</h2>
+                  <p className="sub">Confluence is agreement between checks — <b>not a win probability</b>. Weights: technical {signal.combined.wt}% · ICT {signal.combined.wi}% (adjustable in Risk Lab).</p>
+                  <div className="stats" style={{ marginBottom: 10 }}>
+                    <Stat k="Confluence" v={`${signal.score} / 100`} c={signal.score >= 60 ? 'good' : signal.score <= 40 ? 'bad' : 'flat'} />
+                    <Stat k="Technical" v={`${signal.tech.score} / 100`} c={signal.tech.score >= 60 ? 'good' : signal.tech.score <= 40 ? 'bad' : 'flat'} />
+                    <Stat k="ICT / SMC" v={`${signal.ictS.score} / 100`} c={signal.ictS.score >= 60 ? 'good' : signal.ictS.score <= 40 ? 'bad' : 'flat'} />
+                    <Stat k="Regime" v={`${regime?.emoji || ''} ${regime?.label || '—'}`} c="flat" />
+                    <Stat k="Risk / Reward" v={levels ? `1 : ${levels.rr}` : '—'} c="flat" />
+                  </div>
                   <div className="gauge"><div style={{ width: `${signal.score}%` }} /></div>
                   <div className="gauge-marks"><span>0 · strong sell</span><span>40 · sell edge</span><span>50 · neutral</span><span>60 · buy edge</span><span>100 · strong buy</span></div>
+                  {levels ? (
+                    <div className="stats" style={{ marginTop: 10 }}>
+                      <Stat k="Entry zone" v={fmtPrice(levels.entry, asset.decimals)} c="flat" />
+                      <Stat k="Stop loss" v={fmtPrice(levels.stop, asset.decimals)} c="bad" />
+                      <Stat k="Take profit" v={fmtPrice(levels.takeProfit, asset.decimals)} c="good" />
+                      <Stat k="Risk distance" v={`${levels.riskPct.toFixed(2)}%`} c="flat" />
+                    </div>
+                  ) : (
+                    <p className="sub" style={{ marginTop: 8 }}>NEUTRAL — no plan levels when the robot has no edge. Waiting <i>is</i> the position.</p>
+                  )}
+                </div>
+              </div>
+              <h2 style={{ marginTop: 14 }}>WHY? — generated from live calculations</h2>
+              <p className="sub">Technical ({signal.tech.bull}🟢 / {signal.tech.bear}🔴) + ICT ({signal.ictS.bull}🟢 / {signal.ictS.bear}🔴). Nothing hard-coded.</p>
+              <div className="grid why-grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                <div>
+                  <p className="sub">📐 Technical</p>
+                  {signal.tech.components.map((r, i) => (
+                    <div className="reason" key={'t' + i}>
+                      <span className={`dot ${r.side}`} />
+                      <div><b>{r.label}</b><p>{r.detail}</p></div>
+                      <span className="pts" style={{ color: r.side === 'bull' ? '#34d399' : r.side === 'bear' ? '#fb7185' : '#9aa6d0' }}>{r.points > 0 ? `+${r.points}` : '±0'}</span>
+                    </div>
+                  ))}
+                </div>
+                <div>
+                  <p className="sub">🧠 ICT / SMC</p>
+                  {signal.ictS.components.map((r, i) => (
+                    <div className="reason" key={'s' + i}>
+                      <span className={`dot ${r.side}`} />
+                      <div><b>{r.label}</b><p>{r.detail}</p></div>
+                      <span className="pts" style={{ color: r.side === 'bull' ? '#34d399' : r.side === 'bear' ? '#fb7185' : '#9aa6d0' }}>{r.points > 0 ? `+${r.points}` : '±0'}</span>
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
@@ -410,32 +631,63 @@ export default function App() {
             <>
 
             <div className="grid" style={{ gridTemplateColumns: 'repeat(12,1fr)', marginTop: 16 }}>
-              <div className="card span8">
+              <div className="card span8" id="chart">
                 <h2>📈 Price Lab — trades on chart</h2>
-                <p className="sub">{candles.length} candles · EMA 20/50 + Bollinger + order-blocks + swings · ▲/▼ entries, dots exits</p>
-                <CandleChart candles={candles} ind={ind} trades={result.trades} ict={ict} />
+                <p className="sub">{candles.length} candles · toggle every overlay · ENTRY/SL/TP from SignalBot</p>
+                <CandleChart candles={candles} ind={ind} trades={ovTradesForChart} ict={ict} overlays={overlays} levels={levels} />
+                <OverlayToggles value={overlays} onChange={setOverlays} />
+                <div className="seg" style={{ marginTop: 8 }}>
+                  <button className={showOsc.rsi ? 'on chip' : 'chip'} onClick={() => setShowOsc({ ...showOsc, rsi: !showOsc.rsi })}>{showOsc.rsi ? '☑' : '☐'} RSI panel</button>
+                  <button className={showOsc.macd ? 'on chip' : 'chip'} onClick={() => setShowOsc({ ...showOsc, macd: !showOsc.macd })}>{showOsc.macd ? '☑' : '☐'} MACD panel</button>
+                </div>
+                {showOsc.rsi && <OscillatorPanel candles={candles} lines={[{ data: ind.rsi, color: '#a78bfa' }]} bands={[30, 50, 70]} title="RSI (14) — below 30 oversold, above 70 overbought" />}
+                {showOsc.macd && <OscillatorPanel candles={candles} lines={[{ data: ind.macdLine, color: '#22d3ee' }, { data: ind.signalLine, color: '#f472b6' }]} hist={ind.hist} title="MACD (12, 26, 9) — line vs signal + histogram" />}
               </div>
-              <div className="card span4">
+              <div className="card span4" id="backtest">
                 <h2>💰 Performance</h2>
-                <p className="sub">Fees + slippage included · ATR ({risk.stopAtrMult}×) stops · {risk.takeProfitRR}R targets</p>
+                <p className="sub">Fees + slippage{useFunding && funding ? ' + funding' : ''} included · ATR ({risk.stopAtrMult}×) stops · {risk.takeProfitRR}R targets · {risk.leverage || 1}× leverage</p>
                 <div className="stats">
+                  <Stat k="Initial → Final" v={`${money(risk.initialCapital)} → ${money(result.stats.finalEquity)}`} c="flat" />
                   <Stat k="Net P&L" v={`${money(result.stats.totalNet)}`} c={result.stats.totalNet > 0 ? 'good' : result.stats.totalNet < 0 ? 'bad' : 'flat'} />
                   <Stat k="Return" v={`${result.stats.totalReturnPct.toFixed(2)}%`} c={result.stats.totalReturnPct > 0 ? 'good' : result.stats.totalReturnPct < 0 ? 'bad' : 'flat'} />
-                  <Stat k="Win rate" v={`${result.stats.winRate.toFixed(1)}%`} c="flat" />
+                  <Stat k="Win / Loss rate" v={`${result.stats.winRate.toFixed(1)}% / ${result.stats.lossRate.toFixed(1)}%`} c="flat" />
                   <Stat k="Profit factor" v={fmtPF(result.stats.profitFactor)} c={result.stats.profitFactor > 1.5 ? 'good' : result.stats.profitFactor < 1 ? 'bad' : 'flat'} />
                   <Stat k="Max drawdown" v={`${result.stats.maxDrawdownPct.toFixed(2)}%`} c={result.stats.maxDrawdownPct > 20 ? 'bad' : 'flat'} />
-                  <Stat k="Sharpe" v={result.stats.sharpe.toFixed(2)} c={result.stats.sharpe > 1 ? 'good' : 'flat'} />
+                  <Stat k="Sharpe-like" v={result.stats.sharpe.toFixed(2)} c={result.stats.sharpe > 1 ? 'good' : 'flat'} />
                   <Stat k="Trades" v={result.stats.trades} c="flat" />
                   <Stat k="Expectancy" v={money(result.stats.expectancy)} c={result.stats.expectancy > 0 ? 'good' : 'bad'} />
-                  <Stat k="Final equity" v={money(result.stats.finalEquity)} c="flat" />
+                  <Stat k="Avg win / loss" v={`${money(result.stats.avgWin)} / ${money(result.stats.avgLoss)}`} c="flat" />
+                  <Stat k="Largest win / loss" v={`${money(result.stats.largestWin)} / ${money(result.stats.largestLoss)}`} c="flat" />
+                  <Stat k="Avg hold" v={`${result.stats.avgBars.toFixed(1)} bars`} c="flat" />
                 </div>
+                {wfWarnings.length > 0 && (
+                  <div style={{ marginTop: 10 }}>
+                    {wfWarnings.map((w, i) => (
+                      <div key={i} className="alert" style={w.level === 'high' ? { borderColor: 'rgba(251,113,133,.5)', background: 'rgba(251,113,133,.1)', marginBottom: 6 } : { marginBottom: 6 }}>
+                        {w.level === 'high' ? '⚠️ Possible Overfitting' : '⚠️ Caution'} — {w.text}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <h2 style={{ marginTop: 14 }}>Equity curve</h2>
-                <EquityChart equity={result.equity} initial={risk.initialCapital} />
+                <EquityChart equity={result.equity} initial={risk.initialCapital} trades={result.trades} />
                 <div className="toolbar">
-                  <button className="btn ghost" onClick={doExportCsv}>⬇ CSV trades</button>
-                  <button className="btn ghost" onClick={doExportJson}>⬇ JSON</button>
+                  <button className="btn ghost" onClick={doExportCsv}>⬇ Trades CSV</button>
+                  <button className="btn ghost" onClick={doExportSignals}>⬇ Signals CSV</button>
+                  <button className="btn ghost" onClick={doExportStrategy}>⬇ Strategy JSON</button>
+                  <button className="btn ghost" onClick={doExportReport}>⬇ Report</button>
                   <button className="btn ghost" onClick={doCopy}>📋 Copy summary</button>
                 </div>
+                <h2 style={{ marginTop: 14 }}>🔁 Walk-forward (70/30)</h2>
+                <p className="sub">Train on the first 70%, test on the last 30% (indicators recomputed per side — no peeking).</p>
+                {!wf && <button className="btn ghost" onClick={runWalkForward} disabled={candles.length < 120}>Run walk-forward</button>}
+                {wf && (
+                  <div>
+                    <div className="kv"><span>{wf.is.label}</span><span className={wf.is.stats.totalNet > 0 ? 'pos' : 'neg'}><b>{money(wf.is.stats.totalNet)} ({wf.is.stats.totalReturnPct.toFixed(1)}%)</b></span></div>
+                    <div className="kv"><span>{wf.oos.label}</span><span className={wf.oos.stats.totalNet > 0 ? 'pos' : 'neg'}><b>{money(wf.oos.stats.totalNet)} ({wf.oos.stats.totalReturnPct.toFixed(1)}%)</b></span></div>
+                    <div className="kv"><span>OOS trades / win%</span><span><b>{wf.oos.stats.trades} / {wf.oos.stats.winRate.toFixed(1)}%</b></span></div>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -454,10 +706,15 @@ export default function App() {
               <div className="card span6">
                 <h2>🧠 ICT / SMC — smart-money map</h2>
                 <p className="sub">Bias <b>{ict.bias} ({ict.biasScore})</b> · {ict.zone} · range {fmtPrice(ict.range.low, asset.decimals)} – {fmtPrice(ict.range.high, asset.decimals)}</p>
+                <div className="kv"><span>Structure (last swings)</span><span><b>{[...ict.classified.highs.slice(-2).map((s) => s.kind), ...ict.classified.lows.slice(-2).map((s) => s.kind)].join(' · ') || '—'}</b></span></div>
+                <div className="kv"><span>Session</span><span><b>{ict.session ? `${ict.session.name}${ict.session.killzone ? ' ⚡ killzone' : ''}` : '—'}</b></span></div>
+                <div className="kv"><span>Prev day H / L</span><span><b>{ict.prevDay ? `${fmtPrice(ict.prevDay.high, asset.decimals)} / ${fmtPrice(ict.prevDay.low, asset.decimals)}` : '—'}</b></span></div>
+                <div className="kv"><span>Prev week H / L</span><span><b>{ict.prevWeek ? `${fmtPrice(ict.prevWeek.high, asset.decimals)} / ${fmtPrice(ict.prevWeek.low, asset.decimals)}` : '—'}</b></span></div>
                 <div className="kv"><span>Position in dealing range</span><span><b>{(ict.positionInRange * 100).toFixed(0)}%</b> (0% = range low)</span></div>
-                <div className="kv"><span>Liquidity pools found</span><span><b>{ict.pools?.length || 0}</b></span></div>
-                <div className="kv"><span>Order blocks (recent)</span><span><b>{ict.orderBlocks.length}</b></span></div>
-                <div className="kv"><span>Fair value gaps (recent)</span><span><b>{ict.fvgs.length}</b></span></div>
+                <div className="kv"><span>Liquidity pools (equal H/L)</span><span><b>{ict.pools?.length || 0}</b></span></div>
+                <div className="kv"><span>Order blocks (active / mitigated / violated)</span><span><b>{ict.orderBlocks.filter((o) => o.state === 'active').length} / {ict.orderBlocks.filter((o) => o.state === 'mitigated').length} / {ict.orderBlocks.filter((o) => o.state === 'violated').length}</b></span></div>
+                <div className="kv"><span>Breaker blocks</span><span><b>{ict.breakers.length}</b></span></div>
+                <div className="kv"><span>FVG (open / partial / filled)</span><span><b>{ict.fvgs.filter((g) => g.state === 'unfilled').length} / {ict.fvgs.filter((g) => g.state === 'partial').length} / {ict.fvgs.filter((g) => g.state === 'filled').length}</b></span></div>
                 <h2 style={{ marginTop: 12, fontSize: 14 }}>⚡ Latest structure events</h2>
                 {(ict.events.slice(-8).reverse().length === 0) && <p className="sub">No BOS / sweep in the recent window — chop or slow grind.</p>}
                 {ict.events.slice(-8).reverse().map((e, i) => (
@@ -466,6 +723,9 @@ export default function App() {
                     <div><b>{e.label}</b><p>bar #{e.index} · {new Date(candles[e.index]?.timestamp).toLocaleString()}</p></div>
                     <span className="pts">{e.direction === 1 ? '+4' : '−4'}</span>
                   </div>
+                ))}
+                {ict.breakers.slice(-4).reverse().map((b, i) => (
+                  <div className="kv" key={'br' + i}><span>🧱 {b.label}</span><span>bar #{b.index}</span></div>
                 ))}
                 {ict.orderBlocks.slice(-4).reverse().map((o, i) => (
                   <div className="kv" key={'ob' + i}><span>{o.direction === 1 ? '🟩' : '🟥'} {o.label}</span><span>bar #{o.index}</span></div>
@@ -502,9 +762,16 @@ export default function App() {
             </div>
 
             <div className="card" style={{ marginTop: 16 }}>
-              <h2>⚔️ Strategy Colosseum</h2>
-              <p className="sub">Same candles, same risk settings — may the best robot win. Click “Compare all”.</p>
-              {!compared && <button className="btn" onClick={runCompare}>⚔️ Run all 8 strategies</button>}
+              <h2>⚔️ Strategy Colosseum — tick strategies, run on the same data</h2>
+              <p className="sub">Measured results only — the table never crowns a “best”. Same candles, same risk.</p>
+              <div className="seg" style={{ marginBottom: 10 }}>
+                {STRATEGIES.map((s) => (
+                  <button key={s.id} className={compareIds.includes(s.id) ? 'on chip' : 'chip'} onClick={() => setCompareIds((prev) => (prev.includes(s.id) ? prev.filter((x) => x !== s.id) : [...prev, s.id]))} title={s.tagline}>
+                    {compareIds.includes(s.id) ? '☑' : '☐'} {s.name}
+                  </button>
+                ))}
+              </div>
+              {!compared && <button className="btn" onClick={runCompare}>⚔️ Run {compareIds.length || STRATEGIES.length} selected</button>}
               {compared && (
                 <div className="tbl-wrap" style={{ maxHeight: 340 }}>
                   <table>
@@ -529,6 +796,45 @@ export default function App() {
                   </table>
                 </div>
               )}
+            </div>
+
+            <div className="grid" style={{ gridTemplateColumns: 'repeat(12,1fr)', marginTop: 16 }}>
+              <div className="card span6">
+                <h2>🕐 Multi-timeframe {asset.symbol}</h2>
+                <p className="sub">Same engine, four timeframes. Never force a signal on conflict.</p>
+                {!mtf && <button className="btn ghost" onClick={runMtf} disabled={mtfLoading}>{mtfLoading ? 'Scanning…' : 'Scan 15M / 1H / 4H / 1D'}</button>}
+                {mtf && (
+                  <div>
+                    <div className="tbl-wrap" style={{ maxHeight: 220 }}>
+                      <table>
+                        <thead><tr><th>TF</th><th>Bias</th><th>Score</th><th>Tech</th><th>ICT</th></tr></thead>
+                        <tbody>
+                          {mtf.map((r) => (
+                            <tr key={r.tf}>
+                              <td><b>{r.tf}</b></td>
+                              {r.ok ? (
+                                <>
+                                  <td>{r.direction === 'BUY' ? '🟢 Bullish' : r.direction === 'SELL' ? '🔴 Bearish' : '🟡 Neutral'}</td>
+                                  <td>{r.score}</td><td>{r.tech}</td><td>{r.ict}</td>
+                                </>
+                              ) : (<td colSpan={4}>unavailable</td>)}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    {(() => {
+                      const dirs = [...new Set(mtf.filter((r) => r.ok).map((r) => r.direction))];
+                      return dirs.length > 1
+                        ? (<div className="alert" style={{ marginTop: 8 }}>⚠️ <b>Multi-timeframe conflict detected</b> ({dirs.join(' / ')}) — stand down unless your rules define which timeframe leads.</div>)
+                        : (<p className="sub" style={{ marginTop: 8 }}>✅ Timeframes agree: <b>{dirs[0] || '—'}</b></p>);
+                    })()}
+                  </div>
+                )}
+              </div>
+              <div className="card span6">
+                <RiskCalc asset={asset} levels={levels} lastClose={lastClose} balance={risk.initialCapital} />
+              </div>
             </div>
               </>
             )}
@@ -555,7 +861,64 @@ export default function App() {
           ⚠️ Educational software. Not financial advice. Hypothetical backtests do not guarantee future results. ·
           <a href="https://github.com/sunilkjt/backtest" target="_blank" rel="noreferrer">GitHub: sunilkjt/backtest</a> · Deploys to GitHub Pages at <code>/backtest/</code>.
         </div>
+        <nav className="bottomnav" aria-label="Primary">
+          <a href="#home">🏠<span>Home</span></a>
+          <a href="#markets">💱<span>Markets</span></a>
+          <a href="#backtest">🧪<span>Backtest</span></a>
+          <a href="#signals">🤖<span>Signals</span></a>
+          <button onClick={() => { setView('learn'); setTimeout(() => document.getElementById('signals')?.scrollIntoView({ behavior: 'smooth' }), 60); }}>🎓<span>Learn</span></button>
+        </nav>
       </div>
+    </div>
+  );
+}
+
+function RiskCalc({ asset, levels, lastClose, balance }) {
+  const [bal, setBal] = useState(balance || 10000);
+  const [riskPct, setRiskPct] = useState(1);
+  const [entry, setEntry] = useState(null);
+  const [sl, setSl] = useState(null);
+  const [tp, setTp] = useState(null);
+  const [lev, setLev] = useState(1);
+  const e = entry ?? lastClose ?? levels?.entry ?? 0;
+  const s = sl ?? levels?.stop ?? 0;
+  const t = tp ?? levels?.takeProfit ?? 0;
+  const stopDist = Math.abs(e - s);
+  const tpDist = Math.abs(t - e);
+  const maxLoss = bal * (riskPct / 100);
+  const qty = stopDist > 0 ? maxLoss / stopDist : 0;
+  const notional = qty * e;
+  const margin = lev > 0 ? notional / lev : notional;
+  const profit = tpDist * qty;
+  const rr = stopDist > 0 ? tpDist / stopDist : 0;
+  const liq = lev > 1 && e ? (e > s ? e * (1 - 1 / lev) : e * (1 + 1 / lev)) : null;
+  const liqClose = liq != null && stopDist > 0 && Math.abs(e - liq) < stopDist * 1.5;
+  return (
+    <div>
+      <h2>🧮 Risk Calculator</h2>
+      <p className="sub">Size from risk, not from hope. Prefilled from SignalBot levels.</p>
+      <div className="row2">
+        <div><label className="lbl">Account ($)</label><input type="number" value={bal} onChange={(ev) => setBal(Number(ev.target.value) || 0)} /></div>
+        <div><label className="lbl">Risk (%)</label><input type="number" step="0.25" value={riskPct} onChange={(ev) => setRiskPct(Number(ev.target.value) || 0)} /></div>
+      </div>
+      <div className="row2">
+        <div><label className="lbl">Entry</label><input type="number" value={e || ''} onChange={(ev) => setEntry(Number(ev.target.value) || 0)} /></div>
+        <div><label className="lbl">Stop loss</label><input type="number" value={s || ''} onChange={(ev) => setSl(Number(ev.target.value) || 0)} /></div>
+      </div>
+      <div className="row2">
+        <div><label className="lbl">Take profit</label><input type="number" value={t || ''} onChange={(ev) => setTp(Number(ev.target.value) || 0)} /></div>
+        <div><label className="lbl">Leverage (×)</label><input type="number" min="1" max="50" value={lev} onChange={(ev) => setLev(Math.min(50, Math.max(1, Number(ev.target.value) || 1)))} /></div>
+      </div>
+      <div className="kv"><span>Maximum risk</span><span><b>{money(maxLoss)}</b></span></div>
+      <div className="kv"><span>Position size</span><span><b>{qty.toFixed(4)} {asset?.symbol}</b> (${notional.toLocaleString(undefined, { maximumFractionDigits: 0 })} notional)</span></div>
+      <div className="kv"><span>Margin used</span><span><b>${margin.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b></span></div>
+      <div className="kv"><span>Potential profit</span><span className="pos"><b>{money(profit)}</b></span></div>
+      <div className="kv"><span>Risk / reward</span><span><b>1 : {rr.toFixed(2)}</b></span></div>
+      {liq != null && (
+        <div className="alert" style={liqClose ? { borderColor: 'rgba(251,113,133,.5)', background: 'rgba(251,113,133,.1)', marginTop: 8 } : { marginTop: 8 }}>
+          {liqClose ? '🚨 Liquidation warning' : 'ℹ️ Liquidation'} — est. liq ~{fmtPrice(liq, asset?.decimals)}{liqClose ? ', uncomfortably close to your stop. Lower leverage.' : ', safely beyond your stop.'}
+        </div>
+      )}
     </div>
   );
 }
@@ -644,6 +1007,15 @@ function LearnTab({ asset, market, timeframe, strategy, candles, source, result,
               ['Drawdown', 'Biggest peak-to-trough fall — the pain you must survive.'],
               ['Profit factor', 'Gross wins ÷ gross losses. Above 1.5 = healthy, below 1 = losing.'],
               ['R-multiple', 'Win measured in “risks”: +2R means twice what you risked.'],
+              ['Leverage', 'Borrowed size: 5× turns 1% into 5% — and moves liquidation 5× closer.'],
+              ['Liquidation', 'Forced closure when losses eat your margin. Wider stops need lower leverage.'],
+              ['Slippage', 'The gap between the price you saw and the fill you got. Fast markets slip more.'],
+              ['Funding rate', 'Hourly fee longs pay shorts (or reverse) on perps to pin price to spot.'],
+              ['Market regime', 'What kind of market it is (trend vs chop) — tactics must match the regime.'],
+              ['Confluence', 'Independent reasons agreeing. More agreement, more confidence — never a win %.'],
+              ['In / out-of-sample', 'Test on one slice, verify on another untouched slice. Edges must travel.'],
+              ['Overfitting', 'A rule tuned so tightly to the past it memorized noise instead of signal.'],
+              ['Look-ahead bias', 'Cheating by using future candles. This lab only ever uses data up to bar i.'],
             ].map(([t, d]) => (<tr key={t}><td><b>{t}</b></td><td style={{ textAlign: 'left', whiteSpace: 'normal' }}>{d}</td></tr>))}
           </tbody></table>
         </div>
