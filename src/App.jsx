@@ -751,63 +751,7 @@ export default function App() {
         {/* RESULTS (or the classroom when data failed but the user asked why) */}
         {!loading && ((signal && result && !error) || (error && view === 'learn')) && (
           <>
-            <div className="card span12" style={{ marginTop: 16 }} id="signals">
-              <div className="signal-banner">
-                <div className={`signal-badge ${signal.direction}`}>{signal.direction === 'BUY' ? '▲ BUY' : signal.direction === 'SELL' ? '▼ SELL' : '● HOLD'}<small>{signal.score}/100 · {signal.confidence}</small></div>
-                <div>
-                  <h2 style={{ margin: '0 0 6px' }}>🤖 SignalBot — {asset.symbol} · {timeframe} · {strategy.name}</h2>
-                  <p className="sub">Confluence is agreement between checks — <b>not a win probability</b>. Weights: technical {signal.combined.wt}% · ICT {signal.combined.wi}% (adjustable in Risk Lab).</p>
-                  <div className="stats" style={{ marginBottom: 10 }}>
-                    <Stat k="Confluence" v={`${signal.score} / 100`} c={signal.score >= 60 ? 'good' : signal.score <= 40 ? 'bad' : 'flat'} />
-                    <Stat k="Technical" v={`${signal.tech.score} / 100`} c={signal.tech.score >= 60 ? 'good' : signal.tech.score <= 40 ? 'bad' : 'flat'} />
-                    <Stat k="ICT / SMC" v={`${signal.ictS.score} / 100`} c={signal.ictS.score >= 60 ? 'good' : signal.ictS.score <= 40 ? 'bad' : 'flat'} />
-                    <Stat k="Regime" v={`${regime?.emoji || ''} ${regime?.label || '—'}`} c="flat" />
-                    <Stat k="Risk / Reward" v={levels ? `1 : ${levels.rr}` : '—'} c="flat" />
-                  </div>
-                  <div className="gauge"><div style={{ width: `${signal.score}%` }} /></div>
-                  <div className="gauge-marks"><span>0 · strong sell</span><span>40 · sell edge</span><span>50 · neutral</span><span>60 · buy edge</span><span>100 · strong buy</span></div>
-                  <div className="toolbar">
-                    <button className="btn ghost" onClick={() => { setPage('signals'); window.scrollTo({ top: 0 }); }}>🎯 Open detailed Signals page — thesis, plan, sizer & history →</button>
-                  </div>
-                  {levels ? (
-                    <div className="stats" style={{ marginTop: 10 }}>
-                      <Stat k="Entry zone" v={fmtPrice(levels.entry, asset.decimals)} c="flat" />
-                      <Stat k="Stop loss" v={fmtPrice(levels.stop, asset.decimals)} c="bad" />
-                      <Stat k="Take profit" v={fmtPrice(levels.takeProfit, asset.decimals)} c="good" />
-                      <Stat k="Risk distance" v={`${levels.riskPct.toFixed(2)}%`} c="flat" />
-                    </div>
-                  ) : (
-                    <p className="sub" style={{ marginTop: 8 }}>NEUTRAL — no plan levels when the robot has no edge. Waiting <i>is</i> the position.</p>
-                  )}
-                </div>
-              </div>
-              <h2 style={{ marginTop: 14 }}>WHY? — generated from live calculations</h2>
-              <p className="sub">Technical ({signal.tech.bull}🟢 / {signal.tech.bear}🔴) + ICT ({signal.ictS.bull}🟢 / {signal.ictS.bear}🔴). Nothing hard-coded.</p>
-              <div className="grid why-grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                <div>
-                  <p className="sub">📐 Technical</p>
-                  {signal.tech.components.map((r, i) => (
-                    <div className="reason" key={'t' + i}>
-                      <span className={`dot ${r.side}`} />
-                      <div><b>{r.label}</b><p>{r.detail}</p></div>
-                      <span className="pts" style={{ color: r.side === 'bull' ? '#34d399' : r.side === 'bear' ? '#fb7185' : '#9aa6d0' }}>{r.points > 0 ? `+${r.points}` : '±0'}</span>
-                    </div>
-                  ))}
-                </div>
-                <div>
-                  <p className="sub">🧠 ICT / SMC</p>
-                  {signal.ictS.components.map((r, i) => (
-                    <div className="reason" key={'s' + i}>
-                      <span className={`dot ${r.side}`} />
-                      <div><b>{r.label}</b><p>{r.detail}</p></div>
-                      <span className="pts" style={{ color: r.side === 'bull' ? '#34d399' : r.side === 'bear' ? '#fb7185' : '#9aa6d0' }}>{r.points > 0 ? `+${r.points}` : '±0'}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            <div className="seg" style={{ marginTop: 16 }}>
+            <div className="seg" style={{ marginTop: 16 }} id="results">
               <button className={view === 'lab' ? 'on' : ''} onClick={() => setView('lab')}>🔬 Lab view</button>
               <button className={view === 'learn' ? 'on' : ''} onClick={() => setView('learn')}>🎓 Teach me — beginner view</button>
             </div>
@@ -1021,8 +965,8 @@ export default function App() {
           <a href="#home">🏠<span>Home</span></a>
           <a href="#markets">💱<span>Markets</span></a>
           <a href="#backtest">🧪<span>Backtest</span></a>
-          <a href="#signals">🤖<span>Signals</span></a>
-          <button onClick={() => { setView('learn'); setTimeout(() => document.getElementById('signals')?.scrollIntoView({ behavior: 'smooth' }), 60); }}>🎓<span>Learn</span></button>
+          <button onClick={() => { setPage('signals'); window.scrollTo({ top: 0 }); }}>🎯<span>Signals</span></button>
+          <button onClick={() => { setView('learn'); setTimeout(() => document.getElementById('results')?.scrollIntoView({ behavior: 'smooth' }), 60); }}>🎓<span>Learn</span></button>
         </nav>
         <button
           className={`to-top${showTop ? ' show' : ''}`}

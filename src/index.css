@@ -304,7 +304,7 @@ body { scrollbar-width: thin; scrollbar-color: rgba(34,211,238,.45) rgba(255,255
   background: linear-gradient(180deg, rgba(34,211,238,.9), rgba(167,139,250,.9));
   border: 2px solid transparent; background-clip: padding-box;
 }
-#home, #markets, #chart, #backtest, #signals { scroll-margin-top: 14px; }
+#home, #markets, #chart, #backtest, #results { scroll-margin-top: 14px; }
 .asset-grid, .tbl-wrap { scrollbar-width: thin; scrollbar-color: rgba(167,139,250,.5) transparent; scroll-behavior: smooth; }
 .asset-grid::-webkit-scrollbar, .tbl-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
 .asset-grid::-webkit-scrollbar-thumb, .tbl-wrap::-webkit-scrollbar-thumb {
