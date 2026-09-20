@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Robot from './components/Robot.jsx';
 import CandleChart, { OscillatorPanel, OverlayToggles, DEFAULT_OVERLAYS } from './components/CandleChart.jsx';
 import EquityChart from './components/EquityChart.jsx';
-import { MARKETS, TIMEFRAMES, ASSETS, assetsForMarket } from './lib/assets.js';
+import { MARKETS, TIMEFRAMES, ASSETS, assetsForMarket, hlCategory } from './lib/assets.js';
 import { providerForMarket, UNAVAILABLE, StockProvider, guessStockYahoo } from './lib/providers.js';
 import { computeAll } from './lib/indicators.js';
 import { STRATEGIES, getStrategy, defaultsFor } from './lib/strategies.js';
@@ -139,17 +139,31 @@ export default function App() {
     });
   }, [assetList, extras]);
 
+  // Hyperliquid category filter: all | stocks | crypto | fx (FX + commodities + indices).
+  const [hlFilter, setHlFilter] = useState('all');
   const filtered = useMemo(() => {
+    // Hyperliquid lists 100+ xyz coins — never truncate them to the 80-chip
+    // browsing cap used for Binance's hundreds.
+    const cap = market === 'hyperliquid' ? 400 : 80;
+    let list = allOptions;
+    if (market === 'hyperliquid' && hlFilter !== 'all') {
+      list = list.filter((a) => {
+        const c = hlCategory(a);
+        if (hlFilter === 'stocks') return c === 'stock';
+        if (hlFilter === 'crypto') return c === 'crypto';
+        return c === 'fx' || c === 'commodity' || c === 'index'; // 'fx'
+      });
+    }
     const q = norm(query);
-    if (!q) return allOptions.slice(0, 80);
+    if (!q) return list.slice(0, cap);
     const base = stripQuote(q);
-    return allOptions.filter((a) => {
+    return list.filter((a) => {
       const sym = norm(a.symbol), nm = norm(a.name), rf = norm(a.ref);
       if (sym.includes(q) || nm.includes(q) || rf.includes(q)) return true;
       // "op usdt" → base "op" should still find OP / OPUSDT
       return base.length >= 2 && (sym === base || sym.includes(base) || rf.includes(base));
-    }).slice(0, 80);
-  }, [allOptions, query]);
+    }).slice(0, cap);
+  }, [allOptions, query, market, hlFilter]);
 
   // Hide the custom-ticker button when the query already resolves exactly
   // ("OP USDT" → OPUSDT exists, so no custom needed).
@@ -335,6 +349,7 @@ export default function App() {
     setMarket(m);
     setSymbol(first.symbol);
     setQuery('');
+    setHlFilter('all');
     setCompared(null);
     setTimeout(() => fetchData({ market: m, symbol: first.symbol, asset: first }), 0);
   };
@@ -420,6 +435,7 @@ export default function App() {
   const marketProps = {
     markets: MARKETS, market, symbol, asset, query, setQuery, filtered, allOptions,
     hasExact, binSyms, binLoading, hlCoins, hlLoading, favorites, source, sourceDetail, customLabel,
+    hlFilter, setHlFilter,
     onPickMarket: pickMarket, onPickSymbol: pickSymbol, onLoadCustom: loadCustom,
     onLoadFavorite: loadFavorite, onRemoveFavorite: (k) => setFavorites((prev) => prev.filter((x) => x !== k)),
     onRediscover: rediscoverHL

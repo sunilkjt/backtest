@@ -6,6 +6,7 @@ export default function MarketPicker(props) {
   const {
     markets, market, symbol, asset, query, setQuery, filtered, allOptions,
     hasExact, binSyms, binLoading, hlCoins, hlLoading, favorites, source, sourceDetail, customLabel,
+    hlFilter, setHlFilter,
     onPickMarket, onPickSymbol, onLoadCustom, onLoadFavorite, onRemoveFavorite, onRediscover
   } = props;
   return (
@@ -15,6 +16,13 @@ export default function MarketPicker(props) {
           <button key={m.id} className={market === m.id ? 'on' : ''} onClick={() => onPickMarket(m.id)} title={m.label}><span className="mi">{m.icon}</span><span>{m.label}</span></button>
         ))}
       </div>
+      {market === 'hyperliquid' && (
+        <div className="seg" style={{ marginBottom: 8 }}>
+          {[['all', '🌐 All'], ['stocks', '📈 Stocks'], ['crypto', '🪙 Crypto'], ['fx', '💱 FX · Commodities · Index']].map(([id, label]) => (
+            <button key={id} className={hlFilter === id ? 'on chip' : 'chip'} onClick={() => setHlFilter(id)} title={id === 'stocks' ? 'Every xyz equity perp' : label}>{label}</button>
+          ))}
+        </div>
+      )}
       <label className="lbl">🔍 Search every asset</label>
       <div className="asset-search">
         <span className="si">🔍</span>

@@ -79,3 +79,27 @@ export const ASSETS = [
 export function assetsForMarket(market) {
   return ASSETS.filter((a) => a.market === market);
 }
+
+// Hyperliquid category filter: core dex = crypto perps; xyz dex mixes
+// equities, FX, commodities and indices — everything not in the sets below
+// is an equity. Used by the asset picker so users can list ALL xyz stocks.
+const HL_FX = new Set(['EUR', 'JPY', 'GBP', 'KRW', 'AUD', 'CAD', 'CHF', 'DXY']);
+const HL_COMMODITY = new Set([
+  'GOLD', 'SILVER', 'PLATINUM', 'PALLADIUM', 'COPPER', 'ALUMINIUM',
+  'CL', 'OIL', 'WTI', 'BRENT', 'BRENTOIL', 'NATGAS', 'TTF', 'CORN', 'WHEAT',
+  'URANIUM', 'URNM'
+]);
+const HL_INDEX = new Set([
+  'SP500', 'VIX', 'NIFTY', 'JP225', 'KR200', 'EWY', 'EWJ', 'EWT', 'EWZ',
+  'XLE', 'SMH', 'XBI', 'SOXL', 'MAGS', 'TLT', 'IBOV', 'SPCX'
+]);
+
+export function hlCategory(asset) {
+  const ref = String(asset?.ref || asset?.symbol || '').toUpperCase();
+  if (!ref.startsWith('XYZ:')) return 'crypto';
+  const base = ref.slice(4);
+  if (HL_FX.has(base)) return 'fx';
+  if (HL_COMMODITY.has(base)) return 'commodity';
+  if (HL_INDEX.has(base)) return 'index';
+  return 'stock';
+}
