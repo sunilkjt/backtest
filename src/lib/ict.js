@@ -1,6 +1,12 @@
-// ICT / Smart Money Concepts analysis: swings, structure labels (HH/HL/LH/LL),
-// liquidity, BOS/CHOCH, order blocks (+states, breakers), fair value gaps
-// (+fill states), premium/discount, displacement, sessions, PDH/PDL/PWH/PWL.
+// ICT / Smart Money Concepts analysis — RETROSPECTIVE variant.
+//
+// This module may inspect the complete dataset: final FVG fill states, OBs
+// resolved by later price action, swings confirmed after the fact. It is for
+// CHART VISUALIZATION and the LIVE last-bar signal only.
+//
+// Anything historical (backtester strategies, walk-forward, any signal at
+// bar i < last) MUST use ictEngine.js, which exposes only information
+// available at each bar. See that file for the causal contract.
 
 export function findSwings(candles, left = 3, right = 3) {
   const highs = [], lows = [];

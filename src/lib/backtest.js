@@ -3,6 +3,9 @@
 
 import { getStrategy, STRATEGIES } from './strategies.js';
 import { computeAll } from './indicators.js';
+import { liquidationPrice, PERIODS_PER_YEAR } from './riskModels.js';
+
+export { PERIODS_PER_YEAR };
 
 export const DEFAULT_RISK = {
   initialCapital: 10000,
@@ -14,6 +17,9 @@ export const DEFAULT_RISK = {
   allowShort: true,
   maxBarsInTrade: 0,   // 0 = no time stop
   leverage: 1,         // 1 = spot; >1 scales notional + liquidation risk
+  liquidationModel: 'isolated-simple', // see riskModels.js — always approximate
+  liquidationMmr: 0.01, // maintenance margin for venue-style models
+  periodsPerYear: 252, // bars/year of the traded timeframe (Sharpe annualization)
   funding: null        // [{timestamp, rate}] perp funding; positive = longs pay
 };
 
@@ -122,7 +128,7 @@ export function runBacktest(candles, ind, strategyId, risk = {}, sparams = {}) {
       const maxQty = (eqNow * lev) / price;
       if (qty > maxQty) qty = maxQty;
       if (qty > 0 && Number.isFinite(qty)) {
-        const liq = lev > 1 ? (dir === 1 ? price * (1 - 1 / lev) : price * (1 + 1 / lev)) : null;
+        const liq = lev > 1 ? liquidationPrice(r.liquidationModel || 'isolated-simple', price, dir, lev, r.liquidationMmr) : null;
         position = {
           dir, entry: price, qty, stop, target, liq, entryIdx: i,
           entryTime: candles[i].timestamp, entryEquity: eqNow, riskAmt, leverage: lev
@@ -141,11 +147,11 @@ export function runBacktest(candles, ind, strategyId, risk = {}, sparams = {}) {
     equity[equity.length - 1].equity = cash;
   }
 
-  const stats = calcStats(trades, equity, r.initialCapital);
+  const stats = calcStats(trades, equity, r.initialCapital, r.periodsPerYear);
   return { trades, equity, stats, strategyId };
 }
 
-export function calcStats(trades, equity, initialCapital) {
+export function calcStats(trades, equity, initialCapital, periodsPerYear = 252) {
   const n = trades.length;
   const wins = trades.filter((t) => t.net > 0);
   const losses = trades.filter((t) => t.net <= 0);
@@ -174,7 +180,10 @@ export function calcStats(trades, equity, initialCapital) {
     if (rets.length > 1) {
       const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
       const sd = Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / (rets.length - 1));
-      sharpe = sd > 0 ? (mean / sd) * Math.sqrt(Math.min(rets.length, 252)) : 0;
+      // Timeframe-aware annualization: per-bar returns scale by bars/year
+      // for the traded timeframe. Still an approximation — labeled Sharpe-like.
+      const ppy = Number.isFinite(periodsPerYear) && periodsPerYear > 0 ? periodsPerYear : 252;
+      sharpe = sd > 0 ? (mean / sd) * Math.sqrt(Math.min(rets.length, ppy)) : 0;
     }
   }
 
@@ -190,7 +199,9 @@ export function calcStats(trades, equity, initialCapital) {
 
   return {
     trades: n, wins: wins.length, losses: losses.length, winRate, lossRate,
-    totalNet, totalReturnPct, finalEquity, profitFactor,
+    totalNet, totalReturnPct, finalEquity,
+    startEquity: equity.length ? equity[0].equity : initialCapital,
+    profitFactor,
     maxDrawdown: maxDD, maxDrawdownPct: maxDDPct,
     sharpe, expectancy, avgWin, avgLoss, avgBars,
     largestWin: best, largestLoss: worst, best, worst
@@ -198,28 +209,43 @@ export function calcStats(trades, equity, initialCapital) {
 }
 
 // Walk-forward: train on first `split` fraction (indicators recomputed on the
-// slice — no peeking), test on the rest with a warmup overlap for indicators.
+// slice — no peeking), test on the rest. Warmup history before the boundary
+// feeds INDICATORS only: the OOS portfolio starts flat at the cut bar with
+// fresh capital, so no pre-OOS P/L can leak into OOS accounting.
 export function walkForward(candles, strategyId, risk = {}, split = 0.7, warmup = 200, sparams = {}) {
   const n = candles.length;
   const cut = Math.max(60, Math.floor(n * split));
   const isCandles = candles.slice(0, cut);
   const isRes = runBacktest(isCandles, computeAll(isCandles), strategyId, risk, sparams);
   const start = Math.max(0, cut - warmup);
-  const oosSlice = candles.slice(start);
-  const oosInd = computeAll(oosSlice);
-  const oosRes = runBacktest(oosSlice, oosInd, strategyId, risk, sparams);
-  const offset = start;
+  const indLong = computeAll(candles.slice(start));
+  const off = cut - start;
+  const oosCandles = candles.slice(cut);
+  const oosInd = {};
+  for (const k of Object.keys(indLong)) {
+    oosInd[k] = Array.isArray(indLong[k]) ? indLong[k].slice(off) : indLong[k];
+  }
+  const oosRes = runBacktest(oosCandles, oosInd, strategyId, risk, sparams);
   const oosTrades = oosRes.trades
-    .filter((t) => t.entryIdx + offset >= cut)
-    .map((t) => ({ ...t, entryIdx: t.entryIdx + offset, exitIndex: t.exitIndex + offset }));
+    .map((t) => ({ ...t, entryIdx: t.entryIdx + cut, exitIndex: t.exitIndex + cut }));
   const oosEquity = oosRes.equity
-    .filter((p) => p.index + offset >= cut)
-    .map((p) => ({ ...p, index: p.index + offset }));
-  const oosStats = calcStats(oosTrades, oosEquity, risk.initialCapital ?? DEFAULT_RISK.initialCapital);
+    .map((p) => ({ ...p, index: p.index + cut }));
+  const oosStats = calcStats(oosTrades, oosEquity, risk.initialCapital ?? DEFAULT_RISK.initialCapital, risk.periodsPerYear);
+  // OOS accounting is a fresh run: starting capital = initial capital, no
+  // pre-OOS P/L leaks in. Reported explicitly per the audit spec.
   return {
     split, cut,
     is: { ...isRes, label: `In-sample (first ${Math.round(split * 100)}%)` },
-    oos: { trades: oosTrades, equity: oosEquity, stats: oosStats, strategyId, label: `Out-of-sample (last ${Math.round((1 - split) * 100)}%)` }
+    oos: {
+      trades: oosTrades, equity: oosEquity, stats: oosStats, strategyId,
+      label: `Out-of-sample (last ${Math.round((1 - split) * 100)}%)`,
+      startEquity: oosStats.startEquity,
+      endEquity: oosStats.finalEquity,
+      oosReturn: oosStats.totalReturnPct,
+      oosMaxDrawdown: oosStats.maxDrawdownPct,
+      oosWinRate: oosStats.winRate,
+      oosProfitFactor: oosStats.profitFactor
+    }
   };
 }
 

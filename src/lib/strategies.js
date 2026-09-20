@@ -5,6 +5,7 @@
 // share identical logic (no lookahead: only data up to index i).
 
 import { sma, macd as macdInd, bollinger as bollingerInd, donchian as donchianInd, supertrend as supertrendInd } from './indicators.js';
+import { causalFor, stateAt } from './ictEngine.js';
 
 function P(key, label, def, min, max, step) {
   return { key, label, def, min, max, step };
@@ -27,6 +28,21 @@ function cached(candles, key, fn) {
 }
 function closesOf(candles) {
   return cached(candles, '__closes', () => candles.map((c) => c.close));
+}
+function bodyFrac(c) {
+  return Math.abs(c.close - c.open) / ((c.high - c.low) || 1e-9);
+}
+function displacementUp(c) {
+  return c.close > c.open && bodyFrac(c) > 0.6;
+}
+function displacementDown(c) {
+  return c.close < c.open && bodyFrac(c) > 0.6;
+}
+function bullishEngulf(cur, prev) {
+  return cur.close > cur.open && prev.close < prev.open && cur.close >= prev.open && cur.open <= prev.close;
+}
+function bearishEngulf(cur, prev) {
+  return cur.close < cur.open && prev.close > prev.open && cur.close <= prev.open && cur.open >= prev.close;
 }
 function highsOf(candles) {
   return cached(candles, '__highs', () => candles.map((c) => c.high));
@@ -220,19 +236,42 @@ export const STRATEGIES = [
   {
     id: 'ict-fvg',
     name: 'ICT FVG Entry',
-    tagline: 'Trade away from fresh imbalances',
-    description: 'Long when a bullish FVG formed in the last 5 bars and price holds above EMA-50. Short on bearish FVG below EMA-50.',
-    params: [P('window', 'FVG lookback', 5, 2, 15, 1)],
-    entry: 'Fresh 3-candle imbalance + EMA-50 trend filter.',
-    exit: 'Opposite FVG, ATR stop, or R-multiple target.',
+    tagline: 'Retest a fresh imbalance, enter on confirmation',
+    description: 'Correct ICT sequence only: an FVG is created, survives active, price returns into it, and a confirmation candle fires the entry. Never buys a stale or filled gap.',
+    params: [
+      P('minSizeATR', 'Min FVG size (× ATR)', 0.25, 0.05, 2, 0.05),
+      P('maxAge', 'Max FVG age (bars)', 30, 5, 100, 1),
+      P('entryDepth', 'Entry depth into gap (0–1)', 0.5, 0.1, 1, 0.1),
+      P('confirm', 'Confirmation (0=displacement,1=engulf,2=reclaim-close)', 0, 0, 2, 1)
+    ],
+    entry: 'Fresh/partial FVG ≥ min size and ≤ max age → price dips to entry depth → confirmation candle.',
+    exit: 'Gap fills, opposite confirmed setup, ATR stop, or R-multiple target.',
     signal(c, ind, i, p = {}) {
-      const win = Math.max(2, Math.round(p.window ?? 5));
       if (i < 6) return 0;
-      const e50 = ind.ema50[i];
-      for (let k = Math.max(2, i - win); k <= i; k++) {
-        const a = c[k - 2], b = c[k];
-        if (b.low > a.high && (e50 == null || c[i].close > e50)) return 1;
-        if (b.high < a.low && (e50 == null || c[i].close < e50)) return -1;
+      const atr = ind.atr?.[i];
+      if (atr == null) return 0;
+      const minSize = (p.minSizeATR ?? 0.25) * atr;
+      const maxAge = Math.max(2, Math.round(p.maxAge ?? 30));
+      const depth = Math.min(1, Math.max(0.1, p.entryDepth ?? 0.5));
+      const mode = Math.round(p.confirm ?? 0);
+      const st = stateAt(causalFor(c), i);
+      const cur = c[i], prev = c[i - 1];
+      for (const g of st.fvgs) {
+        if (g.state === 'filled' || g.age > maxAge) continue;
+        if ((g.top - g.bottom) < minSize) continue;
+        if (g.direction === 1) {
+          const touch = g.top - depth * (g.top - g.bottom);
+          if (!(cur.low <= touch && cur.close >= g.bottom)) continue;
+          if (mode === 0 && displacementUp(cur)) return 1;
+          if (mode === 1 && bullishEngulf(cur, prev)) return 1;
+          if (mode === 2 && cur.close > g.top) return 1;
+        } else {
+          const touch = g.bottom + depth * (g.top - g.bottom);
+          if (!(cur.high >= touch && cur.close <= g.top)) continue;
+          if (mode === 0 && displacementDown(cur)) return -1;
+          if (mode === 1 && bearishEngulf(cur, prev)) return -1;
+          if (mode === 2 && cur.close < g.bottom) return -1;
+        }
       }
       return 0;
     }
@@ -240,28 +279,41 @@ export const STRATEGIES = [
   {
     id: 'ict-ob',
     name: 'ICT Order Block',
-    tagline: 'Tap into the block, ride displacement',
-    description: 'Long when price taps a recent bullish order block and prints displacement up. Short on the mirror.',
-    params: [P('lookback', 'OB lookback', 12, 5, 30, 1)],
-    entry: 'Wick into active OB + displacement candle (body > 60% of range).',
-    exit: 'OB violation close, ATR stop, or R-multiple target.',
+    tagline: 'Opposing candle + ATR displacement (+BOS)',
+    description: 'An order block needs proof: an opposing candle, a displacement bar big in both body-fraction AND ATR terms, optionally backed by a recent structure break. Single opposite candles without displacement are ignored.',
+    params: [
+      P('dispMin', 'Min body fraction', 0.6, 0.4, 0.9, 0.05),
+      P('atrMin', 'Min body size (× ATR)', 0.5, 0.1, 3, 0.1),
+      P('useBOS', 'Require structure break (0/1)', 0, 0, 1, 1),
+      P('bosWindow', 'BOS lookback (bars)', 10, 3, 30, 1)
+    ],
+    entry: 'Opposite candle + displacement ≥ size filters (+ optional same-side BOS in window).',
+    exit: 'Zone invalidation close, ATR stop, or R-multiple target.',
     signal(c, ind, i, p = {}) {
-      const lb = Math.max(5, Math.round(p.lookback ?? 12));
       if (i < 4) return 0;
+      const atr = ind.atr?.[i];
+      if (atr == null) return 0;
+      const dispMin = p.dispMin ?? 0.6;
+      const atrMin = p.atrMin ?? 0.5;
+      const needBOS = Math.round(p.useBOS ?? 0) === 1;
+      const win = Math.max(3, Math.round(p.bosWindow ?? 10));
       const cur = c[i];
       const body = Math.abs(cur.close - cur.open);
       const range = cur.high - cur.low || 1e-9;
-      if (body / range < 0.6) return 0;
+      // Both filters must pass — this is what excludes plain opposite candles.
+      if (body / range < dispMin || body < atrMin * atr) return 0;
       const up = cur.close > cur.open;
-      for (let j = Math.max(1, i - lb); j < i; j++) {
-        const p = c[j];
-        const pUp = p.close > p.open;
-        if (up === pUp) continue;
-        const top = Math.max(p.open, p.close), bot = Math.min(p.open, p.close);
-        if (up && cur.low <= top && cur.close > top && (ind.ema50[i] == null || cur.close > ind.ema50[i])) return 1;
-        if (!up && cur.high >= bot && cur.close < bot && (ind.ema50[i] == null || cur.close < ind.ema50[i])) return -1;
+      let zone = false;
+      for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
+        if ((c[j].close > c[j].open) !== up) { zone = true; break; }
       }
-      return 0;
+      if (!zone) return 0;
+      if (needBOS) {
+        const st = stateAt(causalFor(c), i);
+        const ok = st.bos.some((e) => e.direction === (up ? 1 : -1) && e.index >= i - win);
+        if (!ok) return 0;
+      }
+      return up ? 1 : -1;
     }
   },
   {

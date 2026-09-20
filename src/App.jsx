@@ -10,6 +10,7 @@ import { runBacktest, compareSelected, walkForward, overfitWarnings, DEFAULT_RIS
 import { analyzeICT } from './lib/ict.js';
 import { buildSignal, DEFAULT_WEIGHTS } from './lib/signals.js';
 import { detectRegime, tradeLevels, dayChange } from './lib/scores.js';
+import { liquidationPrice, liqLabel, PERIODS_PER_YEAR } from './lib/riskModels.js';
 import { generateDemoCandles } from './lib/demo.js';
 import { tradesToCsv, signalsToCsv, strategyToJson, analysisReport, download, summaryText } from './lib/export.js';
 
@@ -280,7 +281,10 @@ export default function App() {
     return rawCandles.filter((c) => c.timestamp >= from && c.timestamp <= to);
   }, [rawCandles, dateRange]);
 
-  const riskEff = useMemo(() => ({ ...risk, funding: useFunding ? funding : null }), [risk, funding, useFunding]);
+  const riskEff = useMemo(() => ({
+    ...risk, funding: useFunding ? funding : null,
+    periodsPerYear: PERIODS_PER_YEAR[timeframe] || 252
+  }), [risk, funding, useFunding, timeframe]);
   const ind = useMemo(() => (candles.length ? computeAll(candles) : null), [candles]);
   const ict = useMemo(() => (candles.length ? analyzeICT(candles) : null), [candles]);
   const regime = useMemo(() => (candles.length && ind ? detectRegime(candles, ind) : null), [candles, ind]);
@@ -730,7 +734,7 @@ export default function App() {
                   <Stat k="Largest win / loss" v={`${money(result.stats.largestWin)} / ${money(result.stats.largestLoss)}`} c="flat" />
                   <Stat k="Avg hold" v={`${result.stats.avgBars.toFixed(1)} bars`} c="flat" />
                 </div>
-                <p className="sub" style={{ marginTop: 6 }}>Sharpe-like = mean/std of per-bar equity returns (scaled) — rough across timeframes, best used for ranking strategies, not as gospel.</p>
+                <p className="sub" style={{ marginTop: 6 }}>Sharpe-like = mean/std of per-{timeframe} equity returns, annualized ×√(bars/year) — rough across regimes, best used for ranking strategies, not as gospel.</p>
                 {wfWarnings.length > 0 && (
                   <div style={{ marginTop: 10 }}>
                     {wfWarnings.map((w, i) => (
@@ -757,6 +761,8 @@ export default function App() {
                     <div className="kv"><span>{wf.is.label}</span><span className={wf.is.stats.totalNet > 0 ? 'pos' : 'neg'}><b>{money(wf.is.stats.totalNet)} ({wf.is.stats.totalReturnPct.toFixed(1)}%)</b></span></div>
                     <div className="kv"><span>{wf.oos.label}</span><span className={wf.oos.stats.totalNet > 0 ? 'pos' : 'neg'}><b>{money(wf.oos.stats.totalNet)} ({wf.oos.stats.totalReturnPct.toFixed(1)}%)</b></span></div>
                     <div className="kv"><span>OOS trades / win%</span><span><b>{wf.oos.stats.trades} / {wf.oos.stats.winRate.toFixed(1)}%</b></span></div>
+                    <div className="kv"><span>OOS start → end equity</span><span><b>{money(wf.oos.startEquity)} → {money(wf.oos.endEquity)}</b></span></div>
+                    <div className="kv"><span>OOS max drawdown / PF</span><span><b>{wf.oos.stats.maxDrawdownPct.toFixed(1)}% / {fmtPF(wf.oos.stats.profitFactor)}</b></span></div>
                   </div>
                 )}
               </div>
@@ -904,7 +910,7 @@ export default function App() {
                 )}
               </div>
               <div className="card span6">
-                <RiskCalc asset={asset} levels={levels} lastClose={lastClose} balance={risk.initialCapital} />
+                <RiskCalc asset={asset} levels={levels} lastClose={lastClose} balance={risk.initialCapital} model={risk.liquidationModel} onModel={(m) => setRisk({ ...risk, liquidationModel: m })} />
               </div>
             </div>
               </>
@@ -944,7 +950,7 @@ export default function App() {
   );
 }
 
-function RiskCalc({ asset, levels, lastClose, balance }) {
+function RiskCalc({ asset, levels, lastClose, balance, model, onModel }) {
   const [bal, setBal] = useState(balance || 10000);
   const [riskPct, setRiskPct] = useState(1);
   const [entry, setEntry] = useState(null);
@@ -954,6 +960,7 @@ function RiskCalc({ asset, levels, lastClose, balance }) {
   const e = entry ?? lastClose ?? levels?.entry ?? 0;
   const s = sl ?? levels?.stop ?? 0;
   const t = tp ?? levels?.takeProfit ?? 0;
+  const dir = e > s ? 1 : -1;
   const stopDist = Math.abs(e - s);
   const tpDist = Math.abs(t - e);
   const maxLoss = bal * (riskPct / 100);
@@ -962,7 +969,7 @@ function RiskCalc({ asset, levels, lastClose, balance }) {
   const margin = lev > 0 ? notional / lev : notional;
   const profit = tpDist * qty;
   const rr = stopDist > 0 ? tpDist / stopDist : 0;
-  const liq = lev > 1 && e ? (e > s ? e * (1 - 1 / lev) : e * (1 + 1 / lev)) : null;
+  const liq = lev > 1 && e ? liquidationPrice(model || 'isolated-simple', e, dir, lev) : null;
   const liqClose = liq != null && stopDist > 0 && Math.abs(e - liq) < stopDist * 1.5;
   return (
     <div>
@@ -987,9 +994,17 @@ function RiskCalc({ asset, levels, lastClose, balance }) {
       <div className="kv"><span>Risk / reward</span><span><b>1 : {rr.toFixed(2)}</b></span></div>
       {liq != null && (
         <div className="alert" style={liqClose ? { borderColor: 'rgba(251,113,133,.5)', background: 'rgba(251,113,133,.1)', marginTop: 8 } : { marginTop: 8 }}>
-          {liqClose ? '🚨 Liquidation warning' : 'ℹ️ Liquidation'} — est. liq ~{fmtPrice(liq, asset?.decimals)}{liqClose ? ', uncomfortably close to your stop. Lower leverage.' : ', safely beyond your stop.'}
+          {liqClose ? '🚨 Liquidation warning' : 'ℹ️ Liquidation'} — {liqLabel(model || 'isolated-simple')}: ~{fmtPrice(liq, asset?.decimals)}{liqClose ? ', uncomfortably close to your stop. Lower leverage.' : ', safely beyond your stop.'}
         </div>
       )}
+      <div className="row2" style={{ marginTop: 8 }}>
+        <div><label className="lbl">Liquidation model</label>
+          <select value={model || 'isolated-simple'} onChange={(e) => onModel && onModel(e.target.value)}>
+            <option value="isolated-simple">Isolated (simplified)</option>
+            <option value="hyperliquid">Hyperliquid-style (≈)</option>
+          </select>
+        </div>
+      </div>
     </div>
   );
 }
