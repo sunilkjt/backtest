@@ -10,7 +10,7 @@ Live site (GitHub Pages): **https://sunilkjt.github.io/backtest/**
 
 ## Features
 
-- **Markets:** Crypto (Binance Vision spot klines), Hyperliquid perps, Forex / Stocks / Commodities (Yahoo Finance, all timeframes incl. intraday)
+- **Markets:** Crypto (Binance Vision spot klines), Hyperliquid perps incl. **stocks/FX/commodities via the xyz HIP-3 DEX** (`xyz:AAPL`, `xyz:GOLD`…), Forex / Stocks / Commodities spot (Yahoo Finance, all timeframes incl. intraday)
 - **Timeframes:** 15m, 1h, 4h, 1d, 1w
 - **8 strategies:** SMA Cross, EMA+RSI Trend, MACD Momentum, Bollinger Mean-Reversion, RSI Reversion, Donchian Breakout, Supertrend, ICT/SMC Smart Money
 - **Real backtest engine:** fees, slippage, ATR stops, R-multiple take-profits, long/short, fractional risk sizing, equity curve, 15+ stats

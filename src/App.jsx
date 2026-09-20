@@ -376,10 +376,10 @@ export default function App() {
 
         {/* HYPERLIQUID META */}
         <div className="card" style={{ marginTop: 16 }}>
-          <h2>⚡ Hyperliquid adapter</h2>
-          <p className="sub">Public market-data only (<code>POST https://api.hyperliquid.xyz/info</code> — <code>meta</code>, <code>allMids</code>, <code>candle</code>). No wallet keys, no secrets, ever. {hlCoins.length > 0 ? `Discovered ${hlCoins.length} perp markets — showing first 12:` : 'Live discovery needs network access; the bench still works with the built-in list.'}</p>
+          <h2>⚡ Hyperliquid adapter — Hyperliquid-only mode</h2>
+          <p className="sub">Public market-data only (<code>POST https://api.hyperliquid.xyz/info</code> — <code>meta</code>, <code>allMids</code>, <code>candleSnapshot</code>). No wallet keys, no secrets, ever. Pick the <b>Hyperliquid</b> market tab above for a 100% Hyperliquid-only bench — now including <b>stocks (AAPL, NVDA, TSLA…), FX and gold/oil</b> via the HIP-3 <code>xyz</code> builder DEX (coins like <code>xyz:AAPL</code>). Note: xyz equity perps are 24/7 futures with shorter history than spot — use smaller candle counts on 1D/1W. {hlCoins.length > 0 ? `Discovered ${hlCoins.length} perp markets — showing first 14:` : 'Live discovery needs network access; the bench still works with the built-in list.'}</p>
           {hlCoins.length > 0 && (
-            <div className="seg">{hlCoins.slice(0, 12).map((c) => (<span className="chip" key={c.symbol}>{c.symbol} · {c.maxLeverage}×</span>))}</div>
+            <div className="seg">{hlCoins.slice(0, 14).map((c) => (<span className="chip" key={c.dex + c.symbol}>{c.symbol} · {c.maxLeverage}×</span>))}</div>
           )}
         </div>
 

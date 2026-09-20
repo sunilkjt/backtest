@@ -46,30 +46,46 @@ const BINANCE_INTERVAL = { '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d', '1w
 const HL_INTERVAL = { '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w' };
 
 // ---------------- Hyperliquid (public perps market data, no keys) ----------------
+// Core perps (BTC, ETH…) live on the default dex; stocks/forex/commodities
+// live on the HIP-3 builder dex "xyz" (coins like "xyz:AAPL"). Candles use
+// type "candleSnapshot" (the "candle" alias is rejected with 422).
 export class HyperliquidProvider extends MarketDataProvider {
   get id() { return 'hyperliquid'; }
   get label() { return 'Hyperliquid'; }
   endpoint() { return 'https://api.hyperliquid.xyz/info'; }
 
+  dexOf(ref) {
+    const i = String(ref || '').indexOf(':');
+    return i > 0 ? String(ref).slice(0, i) : '';
+  }
+
   async discover() {
-    try {
-      const data = await fetchJson(this.endpoint(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'meta' })
-      });
-      const universe = data?.universe || data?.[0]?.universe || [];
-      return universe.map((u) => ({ symbol: u.name, ref: u.name, maxLeverage: u.maxLeverage })).slice(0, 60);
-    } catch {
-      return [];
+    const out = [];
+    for (const dex of ['', 'xyz']) {
+      try {
+        const body = dex ? { type: 'meta', dex } : { type: 'meta' };
+        const data = await fetchJson(this.endpoint(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const universe = data?.universe || data?.[0]?.universe || [];
+        for (const u of universe) {
+          out.push({ symbol: u.name, ref: u.name, dex: dex || 'core', maxLeverage: u.maxLeverage });
+          if (out.length >= 120) break;
+        }
+      } catch { /* keep what we have */ }
     }
+    return out;
   }
 
   async getPrice({ ref }) {
+    const dex = this.dexOf(ref);
+    const body = dex ? { type: 'allMids', dex } : { type: 'allMids' };
     const data = await fetchJson(this.endpoint(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'allMids' })
+      body: JSON.stringify(body)
     });
     const mids = data?.mids || data;
     if (mids && mids[ref] != null) return parseFloat(mids[ref]);
@@ -81,13 +97,13 @@ export class HyperliquidProvider extends MarketDataProvider {
     if (!interval) throw new Error(UNAVAILABLE);
     const step = TF_MS[timeframe];
     const endTime = Date.now();
-    const startTime = endTime - limit * step;
+    const startTime = endTime - Math.min(limit, 5000) * step;
     let data;
     try {
       data = await fetchJson(this.endpoint(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'candle', req: { coin: ref, interval, startTime, endTime } })
+        body: JSON.stringify({ type: 'candleSnapshot', req: { coin: ref, interval, startTime, endTime } })
       });
     } catch (e) {
       throw new Error(UNAVAILABLE);

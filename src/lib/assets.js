@@ -30,13 +30,31 @@ export const ASSETS = [
   { market: 'crypto', symbol: 'AVAX', name: 'Avalanche', ref: 'AVAXUSDT', decimals: 2 },
   { market: 'crypto', symbol: 'LINK', name: 'Chainlink', ref: 'LINKUSDT', decimals: 2 },
   { market: 'crypto', symbol: 'SUI', name: 'Sui', ref: 'SUIUSDT', decimals: 4 },
-  // Hyperliquid perps (coin names)
+  // Hyperliquid perps (core crypto + HIP-3 "xyz" builder DEX for equities/FX/commodities).
+  // Everything in this market loads from Hyperliquid only (candleSnapshot).
   { market: 'hyperliquid', symbol: 'HYPE', name: 'Hyperliquid', ref: 'HYPE', decimals: 2 },
   { market: 'hyperliquid', symbol: 'BTC', name: 'Bitcoin Perp', ref: 'BTC', decimals: 1 },
   { market: 'hyperliquid', symbol: 'ETH', name: 'Ethereum Perp', ref: 'ETH', decimals: 2 },
   { market: 'hyperliquid', symbol: 'SOL', name: 'Solana Perp', ref: 'SOL', decimals: 2 },
   { market: 'hyperliquid', symbol: 'DOGE', name: 'Dogecoin Perp', ref: 'DOGE', decimals: 5 },
   { market: 'hyperliquid', symbol: 'SUI', name: 'Sui Perp', ref: 'SUI', decimals: 4 },
+  // Hyperliquid-only stocks (xyz equity perps — 24/7, shorter history than spot)
+  { market: 'hyperliquid', symbol: 'AAPL', name: 'Apple Perp (Hyperliquid xyz)', ref: 'xyz:AAPL', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'MSFT', name: 'Microsoft Perp (Hyperliquid xyz)', ref: 'xyz:MSFT', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'NVDA', name: 'NVIDIA Perp (Hyperliquid xyz)', ref: 'xyz:NVDA', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'TSLA', name: 'Tesla Perp (Hyperliquid xyz)', ref: 'xyz:TSLA', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'AMZN', name: 'Amazon Perp (Hyperliquid xyz)', ref: 'xyz:AMZN', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'META', name: 'Meta Perp (Hyperliquid xyz)', ref: 'xyz:META', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'GOOGL', name: 'Alphabet Perp (Hyperliquid xyz)', ref: 'xyz:GOOGL', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'AMD', name: 'AMD Perp (Hyperliquid xyz)', ref: 'xyz:AMD', decimals: 2 },
+  // Hyperliquid-only forex / commodities / index (xyz perps)
+  { market: 'hyperliquid', symbol: 'EUR', name: 'Euro FX Perp (Hyperliquid xyz)', ref: 'xyz:EUR', decimals: 5 },
+  { market: 'hyperliquid', symbol: 'JPY', name: 'Yen FX Perp (Hyperliquid xyz)', ref: 'xyz:JPY', decimals: 3 },
+  { market: 'hyperliquid', symbol: 'GOLD', name: 'Gold Perp (Hyperliquid xyz)', ref: 'xyz:GOLD', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'SILVER', name: 'Silver Perp (Hyperliquid xyz)', ref: 'xyz:SILVER', decimals: 3 },
+  { market: 'hyperliquid', symbol: 'OIL.WTI', name: 'WTI Perp (Hyperliquid xyz)', ref: 'xyz:CL', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'OIL.BRENT', name: 'Brent Perp (Hyperliquid xyz)', ref: 'xyz:BRENTOIL', decimals: 2 },
+  { market: 'hyperliquid', symbol: 'SP500', name: 'S&P 500 Perp (Hyperliquid xyz)', ref: 'xyz:SP500', decimals: 2 },
   // Forex (Yahoo Finance, CORS-safe via proxy fallback)
   { market: 'forex', symbol: 'EUR/USD', name: 'Euro / US Dollar', ref: 'eurusd', yahoo: 'EURUSD=X', decimals: 5 },
   { market: 'forex', symbol: 'GBP/USD', name: 'British Pound / US Dollar', ref: 'gbpusd', yahoo: 'GBPUSD=X', decimals: 5 },
