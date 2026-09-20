@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import CandleChart from './CandleChart.jsx';
 import IctPanel from './IctPanel.jsx';
 import MarketPicker from './MarketPicker.jsx';
+import { liquidationPrice } from '../lib/riskModels.js';
 import {
   categoryBreakdown, setupStrength, computePools, liquidityMap,
   sessionInfo, sizeFor, buildTradePlan, whyWait, assessSetup
@@ -44,7 +45,12 @@ export default function SignalsPage(props) {
     const dir = signal.direction === 'BUY' ? 1 : signal.direction === 'SELL' ? -1 : 0;
     const plan = dir ? buildTradePlan({ candles, ind, eng, levels, dir, pools, prevDay: ict?.prevDay, prevWeek: ict?.prevWeek }) : null;
     const assessment = assessSetup({ candles, eng, signal, plan, mtf, minConf, minRR, gated: signal.gated });
-    const strength = setupStrength(signal.direction, signal.score, assessment.status);
+    // Badge = the signal call (BUY/SELL/STRONG…). Tradability filters such as
+    // min-confluence and min-RR live in assessment.status, shown as its own
+    // "Setup status" stat — they must not glue the badge to NO TRADE.
+    const strength = signal.direction === 'NEUTRAL'
+      ? { label: 'NO TRADE', emoji: '⚪' }
+      : setupStrength(signal.direction, signal.score, 'CONFIRMED');
     const risks = dir ? whyWait({ candles, ind, eng, signal, regime, mtf, plan, minRR, dir }) : [];
     const liq = liquidityMap({ pools, sweeps: st.sweeps, prevDay: ict?.prevDay, prevWeek: ict?.prevWeek, lastClose: candles[n - 1].close });
     const sess = sessionInfo(candles, tz);
@@ -55,11 +61,14 @@ export default function SignalsPage(props) {
 
   const sizing = useMemo(() => {
     if (!setup?.plan) return null;
-    return sizeFor({
+    const entry = setup.plan.zone[0] === setup.plan.zone[1] ? setup.plan.entry : (setup.plan.zone[0] + setup.plan.zone[1]) / 2;
+    const s = sizeFor({
       balance: sizer.balance, riskPct: sizer.riskPct,
-      entry: setup.plan.zone[0] === setup.plan.zone[1] ? setup.plan.entry : (setup.plan.zone[0] + setup.plan.zone[1]) / 2,
-      stop: setup.plan.stop, takeProfit: setup.plan.t1.price, lev: sizer.lev
+      entry, stop: setup.plan.stop, takeProfit: setup.plan.t1.price, lev: sizer.lev
     });
+    // Leverage bites through liquidation: isolated-margin approximation.
+    const liq = sizer.lev > 1 && setup.dir !== 0 ? liquidationPrice('isolated-simple', entry, setup.dir, sizer.lev) : null;
+    return { ...s, entry, liq };
   }, [setup, sizer]);
 
   if (!n || !signal || !setup) {
@@ -275,8 +284,16 @@ export default function SignalsPage(props) {
           {sizing && plan ? (<>
             <div className="kv"><span>Risk $</span><span><b>{money(sizing.maxLoss)}</b></span></div>
             <div className="kv"><span>Size</span><span><b>{sizing.qty.toFixed(4)} {asset.symbol}</b></span></div>
-            <div className="kv"><span>Notional / margin</span><span><b>${sizing.notional.toFixed(0)} / ${sizing.margin.toFixed(0)}</b></span></div>
+            <div className="kv"><span>Notional / margin ({sizer.lev}×)</span><span><b>${sizing.notional.toFixed(0)} / ${sizing.margin.toFixed(0)}</b></span></div>
             <div className="kv"><span>Reward at T1</span><span className="pos"><b>{money(sizing.profit)}</b></span></div>
+            {sizing.liq != null ? (
+              <div className="kv"><span>Liquidation (≈ isolated, {sizer.lev}×)</span><span><b>{fmtP(sizing.liq, dec)}</b></span></div>
+            ) : (
+              <div className="kv"><span>Liquidation</span><span><b>— none at 1× (raise leverage to see it)</b></span></div>
+            )}
+            {sizing.liq != null && Math.abs(sizing.entry - sizing.liq) < Math.abs(sizing.entry - plan.stop) * 1.5 && (
+              <p className="sub" style={{ marginTop: 6 }}>🚨 Liquidation sits uncomfortably close to your stop at {sizer.lev}× — lower the leverage or widen the distance.</p>
+            )}
           </>) : (<p className="sub">Sizer activates once a plan exists.</p>)}
           <h2 style={{ marginTop: 12 }}>🕐 Alignment</h2>
           {!mtf && <button className="btn ghost" onClick={props.runMtf} disabled={mtfLoading}>{mtfLoading ? 'Scanning…' : 'Scan 5M / 15M / 1H / 4H / 1D'}</button>}
