@@ -3,7 +3,7 @@ import Robot from './components/Robot.jsx';
 import CandleChart, { OscillatorPanel, OverlayToggles, DEFAULT_OVERLAYS } from './components/CandleChart.jsx';
 import EquityChart from './components/EquityChart.jsx';
 import { MARKETS, TIMEFRAMES, ASSETS, assetsForMarket } from './lib/assets.js';
-import { providerForMarket, UNAVAILABLE } from './lib/providers.js';
+import { providerForMarket, UNAVAILABLE, StockProvider, guessStockYahoo } from './lib/providers.js';
 import { computeAll } from './lib/indicators.js';
 import { STRATEGIES, getStrategy, defaultsFor } from './lib/strategies.js';
 import { runBacktest, compareSelected, walkForward, overfitWarnings, DEFAULT_RISK } from './lib/backtest.js';
@@ -14,6 +14,7 @@ import { liquidationPrice, liqLabel, PERIODS_PER_YEAR } from './lib/riskModels.j
 import { generateDemoCandles } from './lib/demo.js';
 import { tradesToCsv, signalsToCsv, strategyToJson, analysisReport, download, summaryText } from './lib/export.js';
 import RiskCalc from './components/RiskCalc.jsx';
+import MarketPicker from './components/MarketPicker.jsx';
 import IctPanel from './components/IctPanel.jsx';
 import TradesTable from './components/TradesTable.jsx';
 import SignalsPage, { SignalHistory } from './components/SignalsPage.jsx';
@@ -65,6 +66,9 @@ export default function App() {
   const [histFilter, setHistFilter] = useState('ALL');
   const [autoRefresh, setAutoRefresh] = useState('0');
   const [showTop, setShowTop] = useState(false);
+  // Yahoo-fallback notice: set when a Hyperliquid stock request is served
+  // from another source because the coin is not listed on HL (xyz or core).
+  const [fallbackNote, setFallbackNote] = useState('');
   const [lastUpdated, setLastUpdated] = useState(null);
   const [focus, setFocus] = useState(null);
   const [view, setView] = useState('lab'); // 'lab' | 'learn' — separate beginner tab
@@ -182,6 +186,7 @@ export default function App() {
         data = generateDemoCandles(a.symbol, tf, lim);
         setRawCandles(data);
         setFunding(null);
+        setFallbackNote('');
         setSourceDetail('Demo simulator (seeded random-walk)');
         setSource('demo');
         setPrice(null);
@@ -189,16 +194,69 @@ export default function App() {
         setStage(`Downloading ${a.symbol} ${tf} from ${providerForMarket(m).label}…`);
         await tick();
         const provider = providerForMarket(m);
-        const fetched = await provider.getCandles({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo, timeframe: tf, limit: lim });
+        let fetched;
+        let effectiveProvider = provider;
+        let usedFallback = false;
+        // Hyperliquid stock routing: bare-ticker "Yahoo fallback" assets try
+        // Yahoo spot first with HL as backup; everything else tries
+        // Hyperliquid first with Yahoo spot as backup. Either way the label
+        // below always says which feed actually served the candles.
+        const base = String(a.ref || '').includes(':') ? String(a.ref).split(':').slice(1).join(':') : a.symbol;
+        const ySym = a.yahoo || (m === 'hyperliquid' ? guessStockYahoo(base) : null);
+        // Order: bare-ticker Yahoo-fallback assets try Yahoo spot first (that
+        // is what the user picked); everything else — including xyz: refs —
+        // tries Hyperliquid first so a listed perp is never misrouted to spot.
+        const hlFirst = !(m === 'hyperliquid' && ySym && a.fallback === 'yahoo' && !String(a.ref || '').includes(':'));
+        let firstErr = null;
+        const tryHl = async () => provider.getCandles({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo, timeframe: tf, limit: lim });
+        const tryYahoo = async () => {
+          const fb = new StockProvider();
+          const rows = await fb.getCandles({ symbol: ySym, ref: ySym, yahoo: ySym, timeframe: tf, limit: lim });
+          return { rows, fb };
+        };
+        if (m === 'hyperliquid' && ySym) {
+          if (hlFirst) {
+            try { fetched = await tryHl(); }
+            catch (e) {
+              firstErr = e;
+              setStage(`${a.symbol} is not on Hyperliquid — trying Yahoo Finance…`);
+              await tick();
+              try {
+                const r = await tryYahoo();
+                fetched = r.rows; effectiveProvider = r.fb; usedFallback = true;
+              } catch { throw firstErr; }
+            }
+          } else {
+            try {
+              const r = await tryYahoo();
+              fetched = r.rows; effectiveProvider = r.fb; usedFallback = true;
+            } catch (e) {
+              firstErr = e;
+              setStage(`Yahoo has no ${a.symbol} — trying Hyperliquid…`);
+              await tick();
+              try { fetched = await tryHl(); effectiveProvider = provider; usedFallback = false; }
+              catch { throw firstErr; }
+            }
+          }
+        } else {
+          fetched = await tryHl();
+        }
         data = fetched;
-        setSourceDetail(provider.lastSource || provider.label);
+        if (usedFallback) {
+          const via = effectiveProvider.lastSource ? ` (${effectiveProvider.lastSource})` : '';
+          setSourceDetail(`Yahoo Finance fallback${via} — ${a.symbol} is not listed on Hyperliquid`);
+          setFallbackNote(`${a.symbol} is not listed on Hyperliquid — showing Yahoo Finance spot data, not a perp.`);
+        } else {
+          setSourceDetail(provider.lastSource || provider.label);
+          setFallbackNote('');
+        }
         setStage('Calculating indicators…');
         await tick();
         setRawCandles(data);
         setStage('Detecting market structure…');
         await tick();
         // Perp funding (Hyperliquid only, opt-in): applied as a holding cost.
-        if (fundNow && m === 'hyperliquid' && provider.getFunding && data.length > 1) {
+        if (fundNow && m === 'hyperliquid' && !usedFallback && provider.getFunding && data.length > 1) {
           try {
             const fr = await provider.getFunding({ ref: a.ref, startTime: data[0].timestamp, endTime: data[data.length - 1].timestamp });
             setFunding(fr);
@@ -207,7 +265,7 @@ export default function App() {
           setFunding(null);
         }
         setSource('live');
-        provider.getPrice({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo }).then(setPrice).catch(() => {});
+        effectiveProvider.getPrice({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo }).then(setPrice).catch(() => {});
       }
       setStage('Running backtest…');
       await tick();
@@ -215,6 +273,7 @@ export default function App() {
     } catch (e) {
       setRawCandles([]);
       setFunding(null);
+      setFallbackNote('');
       setSourceDetail('');
       setPrice(null);
       setError(e?.message || UNAVAILABLE);
@@ -267,6 +326,22 @@ export default function App() {
     setCompared(null);
     setTimeout(() => fetchData({ symbol: a.symbol, asset: a }), 0);
   };
+  const loadFavorite = (fm, fs) => {
+    const fa = knownAssets.find((x) => x.market === fm && x.symbol === fs) || assetsForMarket(fm).find((x) => x.symbol === fs);
+    setMarket(fm); setSymbol(fs); setQuery(''); setCompared(null);
+    setTimeout(() => fetchData({ market: fm, symbol: fs, asset: fa }), 0);
+  };
+  // Is this query listed on Hyperliquid (core coin or xyz HIP-3)? Checks the
+  // live discovery plus the built-in bench — stocks only exist as xyz perps.
+  const hyperliquidListed = (raw) => {
+    const q = String(raw || '').trim().toUpperCase();
+    if (!q) return false;
+    const keys = new Set([q]);
+    if (q.includes(':')) keys.add(q.split(':').slice(1).join(':'));
+    else keys.add('XYZ:' + q);
+    const coins = [...hlCoins, ...assetsForMarket('hyperliquid').map((a) => ({ symbol: a.symbol, ref: a.ref }))];
+    return coins.some((c) => keys.has(String(c.symbol).toUpperCase()) || keys.has(String(c.ref).toUpperCase()));
+  };
   const pickTf = (t) => {
     setTimeframe(t);
     setTimeout(() => fetchData({ timeframe: t }), 0);
@@ -281,6 +356,15 @@ export default function App() {
         ? q.split(':')[0].toLowerCase() + ':' + q.split(':').slice(1).join(':').toUpperCase()
         : q.toUpperCase();
       const sym = ref.includes(':') ? ref.split(':')[1] : ref;
+      // Hyperliquid first: core coin or xyz HIP-3 listing → native perp asset.
+      if (hyperliquidListed(ref) || hyperliquidListed(sym)) {
+        return { market, symbol: sym, name: `${sym} (Hyperliquid)`, ref, decimals: 3, extra: true, custom: true };
+      }
+      // Not on Hyperliquid — stock-like tickers fall back to Yahoo spot.
+      const ySym = guessStockYahoo(sym);
+      if (ySym) {
+        return { market, symbol: sym, name: `${sym} (Yahoo fallback — not on Hyperliquid)`, ref, yahoo: ySym, fallback: 'yahoo', decimals: 2, extra: true, custom: true };
+      }
       return { market, symbol: sym, name: `${sym} (Hyperliquid custom)`, ref, decimals: 3, extra: true, custom: true };
     }
     if (market === 'crypto') {
@@ -301,6 +385,25 @@ export default function App() {
     setSymbol(a.symbol);
     setCompared(null);
     setTimeout(() => fetchData({ symbol: a.symbol, asset: a }), 0);
+  };
+
+  // Shared props for the MarketPicker card (Lab tab + Signals tab).
+  // customLabel overrides the custom-ticker button text when a Hyperliquid
+  // stock query is not listed there and will fall back to Yahoo.
+  const customLabel = (() => {
+    const raw = query.trim();
+    if (!raw || hasExact) return null;
+    if (market === 'hyperliquid' && !hyperliquidListed(raw)) {
+      const base = raw.includes(':') ? raw.split(':').slice(1).join(':') : raw;
+      if (guessStockYahoo(base)) return `➕ Load “${raw.toUpperCase()}” via Yahoo fallback (not on Hyperliquid)`;
+    }
+    return null;
+  })();
+  const marketProps = {
+    markets: MARKETS, market, symbol, asset, query, setQuery, filtered, allOptions,
+    hasExact, binSyms, binLoading, hlCoins, favorites, source, sourceDetail, customLabel,
+    onPickMarket: pickMarket, onPickSymbol: pickSymbol, onLoadCustom: loadCustom,
+    onLoadFavorite: loadFavorite, onRemoveFavorite: (k) => setFavorites((prev) => prev.filter((x) => x !== k))
   };
 
   // Date-range window: all downstream math (indicators → backtest) uses this slice,
@@ -521,6 +624,7 @@ export default function App() {
               <span className="badge">📊 Real backtest engine</span>
               <span className="badge">🧠 ICT / SMC lab</span>
               <span className={source === 'live' ? 'badge live' : 'badge demo'}>{source === 'live' ? '● LIVE market data' : '● DEMO · simulated data'}</span>
+              {fallbackNote && <span className="badge demo" title={fallbackNote}>💱 Yahoo fallback</span>}
               {asset && <span className="badge">🔗 {providerForMarket(market).label}</span>}
               {regime && candles.length > 0 && <span className="badge">{regime.emoji} {regime.label}</span>}
             </div>
@@ -557,7 +661,8 @@ export default function App() {
             history={historyLive} histFilter={histFilter} setHistFilter={setHistFilter}
             onClearHistory={() => setHistory(clearHistory())}
             focus={focus} setFocus={setFocus} overlays={overlays}
-            lastClose={lastClose} error={error}
+            lastClose={lastClose} error={error} marketProps={marketProps}
+            fallbackNote={fallbackNote}
           />
         ) : (
         <>
@@ -566,68 +671,7 @@ export default function App() {
           <div className="card span4">
             <h2>1️⃣ Market & Asset</h2>
             <p className="sub">Pick a laboratory bench. Hyperliquid serves perps; others serve spot / cash.</p>
-            <div className="seg market-seg">
-              {MARKETS.map((m) => (
-                <button key={m.id} className={market === m.id ? 'on' : ''} onClick={() => pickMarket(m.id)} title={m.label}><span className="mi">{m.icon}</span><span>{m.label}</span></button>
-              ))}
-            </div>
-            <label className="lbl">🔍 Search every asset</label>
-            <div className="asset-search">
-              <span className="si">🔍</span>
-              <input
-                type="text"
-                placeholder={market === 'hyperliquid' ? 'Search 120+ coins — e.g. TSLA, xyz:PLTR, HYPE…' : market === 'crypto' ? 'Search Binance — e.g. PEPE, ONDO, ARB…' : 'Search or type any ticker — e.g. GOOGL, EURUSD=X…'}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && query.trim()) {
-                    if (filtered.length > 0) pickSymbol(filtered[0].symbol);
-                    else loadCustom(query);
-                  }
-                }}
-              />
-            </div>
-            <p className="asset-count">
-              <span className="pill">{query.trim() ? `${filtered.length} match${filtered.length === 1 ? '' : 'es'}` : `${allOptions.length} assets`}</span>
-              <span>{query.trim()
-                ? `for “${query.trim()}”`
-                : 'available'
-              }{market === 'crypto' ? (binSyms ? '' : binLoading ? ' · loading full Binance list…' : '') : market === 'hyperliquid' ? (hlCoins.length ? '' : ' · discovering Hyperliquid markets…') : ''}
-              {allOptions.length > filtered.length && !query.trim() && ` · showing ${filtered.length} — search to narrow`}</span>
-            </p>
-            <div className="asset-grid">
-              {filtered.map((a) => (
-                <button key={a.symbol + '|' + a.ref} className={symbol === a.symbol ? 'on chip' : 'chip'} onClick={() => pickSymbol(a.symbol)} title={`${a.name} · feed ${a.yahoo || a.ref}`}>
-                  {a.symbol}
-                </button>
-              ))}
-              {filtered.length === 0 && <p className="sub asset-empty">No match — check spelling or load it as a custom ticker below.</p>}
-            </div>
-            {query.trim() && !hasExact && (
-              <button className="btn ghost" style={{ marginTop: 8, width: '100%' }} onClick={() => loadCustom(query)}>
-                ➕ Load “{query.trim().toUpperCase()}” as custom {market === 'hyperliquid' ? 'Hyperliquid coin (tip: xyz:TSLA format for equities)' : market === 'crypto' ? 'Binance symbol' : 'Yahoo ticker'}
-              </button>
-            )}
-            <p className="sub" style={{ marginTop: 10 }}>Tip: spaces and “/” are ignored — “op usdt”, “op/usdt” and “opusdt” all find OP.</p>
-            {favorites.length > 0 && (
-              <div>
-                <label className="lbl">★ Favorites (saved on this device)</label>
-                <div className="seg">
-                  {favorites.map((k) => {
-                    const [fm, fs] = k.split('|');
-                    return (<span key={k} style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
-                      <button className="chip" title={`Load ${fs} on ${fm}`} onClick={() => {
-                        const fa = [...ASSETS, ...customs].find((x) => x.market === fm && x.symbol === fs) || assetsForMarket(fm).find((x) => x.symbol === fs);
-                        setMarket(fm); setSymbol(fs); setQuery(''); setCompared(null);
-                        setTimeout(() => fetchData({ market: fm, symbol: fs, asset: fa }), 0);
-                      }}>{fm === market && fs === symbol ? '● ' : ''}{fs}</button>
-                      <button className="chip" title={`Remove ${fs} from favorites`} onClick={() => setFavorites((prev) => prev.filter((x) => x !== k))} style={{ padding: '8px 9px' }}>✕</button>
-                    </span>);
-                  })}
-                </div>
-              </div>
-            )}
-            <p className="sub" style={{ marginTop: 10 }}>{asset?.name} · feed <code>{asset?.yahoo || asset?.ref}</code>{sourceDetail && source === 'live' && (<span> · via {sourceDetail}</span>)}</p>
+            <MarketPicker {...marketProps} />
           </div>
 
           <div className="card span4">
@@ -745,6 +789,11 @@ export default function App() {
         {source === 'demo' && candles.length > 0 && (
           <div className="card" style={{ marginTop: 16 }}>
             <div className="alert">🎭 <b>DEMO · simulated data in use</b> — deterministic random-walk for testing the lab offline. NOT live market data. Toggle it off in the Risk Lab card to retry live providers.</div>
+          </div>
+        )}
+        {fallbackNote && source === 'live' && candles.length > 0 && (
+          <div className="card" style={{ marginTop: 16 }}>
+            <div className="alert">💱 <b>Yahoo Finance fallback in use</b> — {fallbackNote}</div>
           </div>
         )}
 

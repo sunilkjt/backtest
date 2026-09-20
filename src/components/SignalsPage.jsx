@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import CandleChart from './CandleChart.jsx';
 import IctPanel from './IctPanel.jsx';
+import MarketPicker from './MarketPicker.jsx';
 import {
   categoryBreakdown, setupStrength, computePools, liquidityMap,
   sessionInfo, sizeFor, buildTradePlan, whyWait, assessSetup
@@ -23,10 +24,17 @@ export default function SignalsPage(props) {
     providerLabel, onAnalyze, analyzing, lastUpdated, autoRefresh, setAutoRefresh,
     minConf, setMinConf, minRR, setMinRR, tz, setTz, sizer, setSizer,
     history, histFilter, setHistFilter, onClearHistory, focus, setFocus,
-    overlays, statusForHistory
+    overlays, statusForHistory, marketProps
   } = props;
   const dec = asset?.decimals ?? 2;
   const n = candles.length;
+  const pickerCard = (
+    <div className="card" style={{ marginTop: 16 }}>
+      <h2>💱 Market & Asset</h2>
+      <p className="sub">Pick what to analyze, then hit ANALYZE MARKET below.</p>
+      <MarketPicker {...marketProps} />
+    </div>
+  );
 
   const setup = useMemo(() => {
     if (!n || !ind || !signal) return null;
@@ -56,13 +64,16 @@ export default function SignalsPage(props) {
 
   if (!n || !signal || !setup) {
     return (
-      <div className="card" style={{ marginTop: 16 }}>
-        <h2>🎯 Signals — current market analysis</h2>
-        <p className="sub">No analysis yet{props.error ? ` — ${props.error}` : '. Select a market and run the analysis.'}</p>
-        <div className="toolbar">
-          <button className="btn" disabled={analyzing} onClick={onAnalyze}>{analyzing ? '🤖 Analyzing…' : '🔍 ANALYZE MARKET'}</button>
+      <>
+        {pickerCard}
+        <div className="card" style={{ marginTop: 16 }}>
+          <h2>🎯 Signals — current market analysis</h2>
+          <p className="sub">No analysis yet{props.error ? ` — ${props.error}` : '. Select a market and run the analysis.'}</p>
+          <div className="toolbar">
+            <button className="btn" disabled={analyzing} onClick={onAnalyze}>{analyzing ? '🤖 Analyzing…' : '🔍 ANALYZE MARKET'}</button>
+          </div>
         </div>
-      </div>
+      </>
     );
   }
 
@@ -73,11 +84,12 @@ export default function SignalsPage(props) {
 
   return (
     <>
+      {pickerCard}
       <div className="card" style={{ marginTop: 16 }}>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'end', justifyContent: 'space-between' }}>
           <div>
             <h2 style={{ margin: 0 }}>🎯 SIGNALS — {asset.symbol} / {timeframe}</h2>
-            <p className="sub" style={{ margin: '4px 0 0' }}>{strategy.name} · {providerLabel} · {source === 'live' ? 'LIVE' : 'DEMO'} · {n} candles</p>
+            <p className="sub" style={{ margin: '4px 0 0' }}>{strategy.name} · {providerLabel} · {source === 'live' ? 'LIVE' : 'DEMO'} · {n} candles{props.fallbackNote ? ` · 💱 ${props.fallbackNote}` : ''}</p>
           </div>
           <div className="toolbar" style={{ marginTop: 0 }}>
             <button className="btn" disabled={analyzing} onClick={onAnalyze}>{analyzing ? '🤖 Analyzing…' : '🔍 ANALYZE MARKET'}</button>

@@ -61,7 +61,10 @@ export class HyperliquidProvider extends MarketDataProvider {
 
   async discover() {
     const out = [];
+    // Per-dex cap (not a global one): truncating core must never starve the
+    // xyz HIP-3 listing, which is where all the stocks/FX/commodities live.
     for (const dex of ['', 'xyz']) {
+      let n = 0;
       try {
         const body = dex ? { type: 'meta', dex } : { type: 'meta' };
         const data = await fetchJson(this.endpoint(), {
@@ -72,7 +75,7 @@ export class HyperliquidProvider extends MarketDataProvider {
         const universe = data?.universe || data?.[0]?.universe || [];
         for (const u of universe) {
           out.push({ symbol: u.name, ref: u.name, dex: dex || 'core', maxLeverage: u.maxLeverage });
-          if (out.length >= 120) break;
+          if (++n >= 250) break;
         }
       } catch { /* keep what we have */ }
     }
@@ -387,4 +390,30 @@ export function providerForMarket(market) {
     case 'commodities': return new CommodityProvider();
     default: return new CryptoProvider();
   }
+}
+
+// ---------------- Hyperliquid stock fallback ----------------
+// Stocks/FX/commodities on Hyperliquid live ONLY on the HIP-3 xyz dex —
+// anything not listed there must come from another source (Yahoo spot).
+// guessStockYahoo maps a bare ticker to its Yahoo symbol, or null when the
+// query is not stock-like (or is a known crypto major that belongs on HL).
+const HL_FALLBACK_YAHOO = {
+  EUR: 'EURUSD=X', GBP: 'GBPUSD=X', JPY: 'JPY=X', AUD: 'AUDUSD=X', CHF: 'USDCHF=X', CAD: 'USDCAD=X',
+  GOLD: 'GC=F', SILVER: 'SI=F', PLATINUM: 'PL=F', COPPER: 'HG=F', OIL: 'CL=F', WTI: 'CL=F', BRENT: 'BZ=F', NATGAS: 'NG=F',
+  SP500: '^GSPC', SPX: '^GSPC', NASDAQ: '^IXIC', DOW: '^DJI'
+};
+// Crypto majors live on the HL core dex — never misroute them to Yahoo.
+const HL_CORE_CRYPTO = new Set([
+  'BTC', 'ETH', 'SOL', 'DOGE', 'SUI', 'HYPE', 'XRP', 'ADA', 'AVAX', 'LINK', 'BNB',
+  'TRX', 'TON', 'DOT', 'ARB', 'OP', 'NEAR', 'ATOM', 'LTC', 'BCH', 'XLM', 'ALGO',
+  'VET', 'ICP', 'FIL', 'HBAR', 'APT', 'TAO', 'INJ', 'SEI', 'JUP', 'ONDO', 'PEPE', 'WIF'
+]);
+
+export function guessStockYahoo(symbol) {
+  const s = String(symbol || '').trim().toUpperCase().replace(/[\s/_.\-]/g, '');
+  if (!s) return null;
+  if (HL_FALLBACK_YAHOO[s]) return HL_FALLBACK_YAHOO[s];
+  if (HL_CORE_CRYPTO.has(s)) return null;
+  if (/^[A-Z]{1,5}$/.test(s)) return s; // looks like a US equity ticker
+  return null;
 }
