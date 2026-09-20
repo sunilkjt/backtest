@@ -120,6 +120,11 @@ export default function SignalsPage(props) {
           </div>
         </div>
         <div className="kv"><span>Last updated</span><span><b>{lastUpdated ? new Date(lastUpdated).toLocaleTimeString() : '—'}</b></span></div>
+        <div><label className="lbl">Timeframe</label>
+          <div className="seg">{props.timeframes.map((t) => (
+            <button key={t.id} className={timeframe === t.id ? 'on chip' : 'chip'} onClick={() => props.onPickTimeframe(t.id)}>{t.label}</button>
+          ))}</div>
+        </div>
         <div className="row2">
           <div><label className="lbl">Minimum confluence: {minConf}</label>
             <div className="seg">{[50, 60, 70, 80, 90].map((v) => (<button key={v} className={minConf === v ? 'on chip' : 'chip'} onClick={() => setMinConf(v)}>{v}</button>))}</div>

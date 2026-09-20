@@ -681,7 +681,7 @@ export default function App() {
             onClearHistory={() => setHistory(clearHistory())}
             focus={focus} setFocus={setFocus} overlays={overlays}
             lastClose={lastClose} error={error} marketProps={marketProps}
-            fallbackNote={fallbackNote}
+            fallbackNote={fallbackNote} timeframes={TIMEFRAMES} onPickTimeframe={pickTf}
           />
         ) : (
         <>
