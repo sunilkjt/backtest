@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 
 export const DEFAULT_OVERLAYS = {
   ema20: true, ema50: true, ema200: false, bb: true, volume: true,
-  trades: true, ob: true, fvg: false, swings: true, pdhl: true, levels: true
+  trades: true, ob: true, fvg: false, swings: true, pdhl: true, levels: true,
+  structure: true, sweeps: true, pools: false, breakers: true, sessions: false
 };
 
 // Cartoon-styled canvas candlestick chart with toggleable indicator,
@@ -11,6 +12,12 @@ export default function CandleChart({ candles, ind, trades = [], ict = null, hei
   const ref = useRef(null);
   const tipRef = useRef(null);
   const ov = { ...DEFAULT_OVERLAYS, ...(overlays || {}) };
+  const [, setW] = useState(0);
+  useEffect(() => {
+    const onR = () => setW((w) => w + 1);
+    window.addEventListener('resize', onR);
+    return () => window.removeEventListener('resize', onR);
+  }, []);
 
   useEffect(() => {
     const canvas = ref.current;
@@ -164,6 +171,87 @@ export default function CandleChart({ candles, ind, trades = [], ict = null, hei
       }
     }
 
+    // market-structure rays (BOS/CHOCH levels extending right)
+    if (ov.structure && ict?.events) {
+      ctx.font = 'bold 9px system-ui';
+      for (const e of ict.events.filter((ev) => ev.type.startsWith('bos') || ev.type.startsWith('choch')).slice(-6)) {
+        if (!Number.isFinite(e.price)) continue;
+        const x0 = x(e.index);
+        const x1 = Math.min(W - padR, x0 + cw * 24);
+        ctx.strokeStyle = e.direction === 1 ? 'rgba(52,211,153,0.65)' : 'rgba(251,113,133,0.65)';
+        ctx.lineWidth = 1.2; ctx.setLineDash([6, 3]);
+        ctx.beginPath(); ctx.moveTo(x0, y(e.price)); ctx.lineTo(x1, y(e.price)); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = e.direction === 1 ? 'rgba(52,211,153,0.95)' : 'rgba(251,113,133,0.95)';
+        ctx.fillText(e.type.startsWith('choch') ? 'CHoCH' : 'BOS', x0 + 3, y(e.price) - 4);
+      }
+    }
+
+    // liquidity-sweep diamonds
+    if (ov.sweeps && ict?.events) {
+      for (const e of ict.events.filter((ev) => ev.type.startsWith('sweep')).slice(-8)) {
+        const cx = x(e.index);
+        const cy = e.direction === 1 ? y(candles[e.index].low) + 10 : y(candles[e.index].high) - 10;
+        ctx.fillStyle = e.direction === 1 ? '#34d399' : '#fb7185';
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - 5); ctx.lineTo(cx + 5, cy); ctx.lineTo(cx, cy + 5); ctx.lineTo(cx - 5, cy);
+        ctx.closePath(); ctx.fill();
+      }
+    }
+
+    // equal-high/low liquidity pools (recent only, to avoid clutter)
+    if (ov.pools && ict?.pools) {
+      ctx.font = 'bold 9px system-ui';
+      for (const p of ict.pools.slice(-4)) {
+        ctx.strokeStyle = p.kind === 'high' ? 'rgba(251,113,133,0.55)' : 'rgba(52,211,153,0.55)';
+        ctx.setLineDash([2, 3]); ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(x(Math.max(0, n - 60)), y(p.price)); ctx.lineTo(W - padR, y(p.price)); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(238,242,255,0.75)';
+        ctx.fillText(`${p.kind === 'high' ? 'EQH' : 'EQL'}×${p.touches}`, padL + 4, y(p.price) - 3);
+      }
+    }
+
+    // breaker blocks (failed OBs flip polarity)
+    if (ov.breakers && ict?.breakers) {
+      for (const b of ict.breakers.slice(-4)) {
+        const x0 = x(Math.max(0, b.index));
+        ctx.fillStyle = 'rgba(167,139,250,0.12)';
+        ctx.fillRect(x0, y(b.top), W - padR - x0, Math.max(2, y(b.bottom) - y(b.top)));
+        ctx.strokeStyle = 'rgba(167,139,250,0.55)';
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(x0, y(b.top), W - padR - x0, Math.max(2, y(b.bottom) - y(b.top)));
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(167,139,250,0.95)';
+        ctx.font = 'bold 9px system-ui';
+        ctx.fillText('BRK', x0 + 3, y(b.top) + 11);
+      }
+    }
+
+    // session day separators + killzone shading (intraday only)
+    if (ov.sessions && n > 1) {
+      const barSpan = (candles[n - 1].timestamp - candles[0].timestamp) / Math.max(1, n - 1);
+      if (barSpan < 12 * 36e5) {
+        let lastDay = new Date(candles[0].timestamp).getUTCDate();
+        ctx.font = '9px system-ui';
+        for (let i = 1; i < n; i++) {
+          const d = new Date(candles[i].timestamp);
+          if (d.getUTCDate() !== lastDay) {
+            lastDay = d.getUTCDate();
+            ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(x(i), padT); ctx.lineTo(x(i), padT + priceH); ctx.stroke();
+            ctx.setLineDash([]);
+          }
+          const h = d.getUTCHours() + d.getUTCMinutes() / 60;
+          if ((h >= 7 && h < 10) || (h >= 12 && h < 15)) {
+            ctx.fillStyle = 'rgba(34,211,238,0.045)';
+            ctx.fillRect(x(i) - cw / 2, padT, cw, priceH);
+          }
+        }
+      }
+    }
+
     // trade plan levels (entry/SL/TP from SignalBot)
     if (ov.levels && levels) {
       const plan = [
@@ -232,8 +320,7 @@ export default function CandleChart({ candles, ind, trades = [], ict = null, hei
     const onLeave = () => { if (tipRef.current) tipRef.current.style.display = 'none'; };
     canvas.onmousemove = onMove;
     canvas.onmouseleave = onLeave;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  });
+  }, [candles, ind, trades, ict, height, overlays, levels]);
 
   return (
     <div style={{ position: 'relative' }}>
@@ -255,6 +342,10 @@ export default function CandleChart({ candles, ind, trades = [], ict = null, hei
 // Generic oscillator sub-panel (RSI with bands, or MACD lines + histogram).
 export function OscillatorPanel({ candles, lines = [], hist = null, bands = [], height = 120, title = '' }) {
   const ref = useRef(null);
+  const lastVals = lines.map((l) => {
+    const d = (l.data || []).filter((v) => v != null && Number.isFinite(v));
+    return d.length ? d[d.length - 1] : null;
+  });
   useEffect(() => {
     const canvas = ref.current;
     if (!canvas || !candles?.length) return;
@@ -303,10 +394,13 @@ export function OscillatorPanel({ candles, lines = [], hist = null, bands = [], 
       }
       ctx.stroke();
     }
-  });
+  }, [candles, lines, hist, bands, height]);
+  const withVals = lastVals.some((v) => v != null)
+    ? `${title} · now ${lastVals.map((v) => (v == null ? '—' : v.toFixed(2))).join(' / ')}`
+    : title;
   return (
     <div style={{ marginTop: 8 }}>
-      {title && <div style={{ fontSize: 12, color: '#9aa6d0', marginBottom: 4 }}>{title}</div>}
+      {title && <div style={{ fontSize: 12, color: '#9aa6d0', marginBottom: 4 }}>{withVals}</div>}
       <canvas ref={ref} className="chart" />
     </div>
   );
@@ -316,7 +410,8 @@ export function OverlayToggles({ value, onChange }) {
   const items = [
     ['ema20', 'EMA 20'], ['ema50', 'EMA 50'], ['ema200', 'EMA 200'], ['bb', 'Bollinger'],
     ['volume', 'Volume'], ['trades', 'Trades'], ['ob', 'Order blocks'],
-    ['fvg', 'FVG'], ['swings', 'Swings'], ['pdhl', 'PDH/PDL/PWH/PWL'], ['levels', 'Entry/SL/TP']
+    ['fvg', 'FVG'], ['swings', 'Swings'], ['pdhl', 'PDH/PDL/PWH/PWL'], ['levels', 'Entry/SL/TP'],
+    ['structure', 'BOS/CHOCH'], ['sweeps', 'Sweeps'], ['pools', 'EQH/EQL'], ['breakers', 'Breakers'], ['sessions', 'Sessions']
   ];
   return (
     <div className="seg" style={{ marginTop: 8 }}>

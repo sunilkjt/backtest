@@ -9,6 +9,8 @@ export const MARKETS = [
 ];
 
 export const TIMEFRAMES = [
+  { id: '1m', label: '1m' },
+  { id: '5m', label: '5m' },
   { id: '15m', label: '15m' },
   { id: '1h', label: '1H' },
   { id: '4h', label: '4H' },

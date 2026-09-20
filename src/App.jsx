@@ -5,7 +5,7 @@ import EquityChart from './components/EquityChart.jsx';
 import { MARKETS, TIMEFRAMES, ASSETS, assetsForMarket } from './lib/assets.js';
 import { providerForMarket, UNAVAILABLE } from './lib/providers.js';
 import { computeAll } from './lib/indicators.js';
-import { STRATEGIES, getStrategy } from './lib/strategies.js';
+import { STRATEGIES, getStrategy, defaultsFor } from './lib/strategies.js';
 import { runBacktest, compareSelected, walkForward, overfitWarnings, DEFAULT_RISK } from './lib/backtest.js';
 import { analyzeICT } from './lib/ict.js';
 import { buildSignal, DEFAULT_WEIGHTS } from './lib/signals.js';
@@ -43,10 +43,14 @@ export default function App() {
   const [price, setPrice] = useState(null);
   const [compared, setCompared] = useState(null);
   const [compareIds, setCompareIds] = useState(ls.compareIds || STRATEGIES.map((s) => s.id));
+  const [sparamsById, setSparamsById] = useState(ls.sparamsById || {});
+  const [gateRegime, setGateRegime] = useState(ls.gateRegime || false);
+  const [sourceDetail, setSourceDetail] = useState('');
   const [wf, setWf] = useState(null);
   const [mtf, setMtf] = useState(null);
   const [mtfLoading, setMtfLoading] = useState(false);
   const [view, setView] = useState('lab'); // 'lab' | 'learn' — separate beginner tab
+  const [learnFromError, setLearnFromError] = useState(false);
   const [hlCoins, setHlCoins] = useState([]);
   const [query, setQuery] = useState('');
   const [customs, setCustoms] = useState([]); // user-loaded tickers not in the built-in list
@@ -128,10 +132,10 @@ export default function App() {
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({
         market, symbol, timeframe, strategyId, limit, risk, weights,
-        overlays, showOsc, favorites, compareIds
+        overlays, showOsc, favorites, compareIds, sparamsById, gateRegime
       }));
     } catch { /* storage full/blocked — lab still works */ }
-  }, [market, symbol, timeframe, strategyId, limit, risk, weights, overlays, showOsc, favorites, compareIds]);
+  }, [market, symbol, timeframe, strategyId, limit, risk, weights, overlays, showOsc, favorites, compareIds, sparamsById, gateRegime]);
 
   const tick = () => new Promise((r) => setTimeout(r, 30));
 
@@ -156,6 +160,7 @@ export default function App() {
         await new Promise((r) => setTimeout(r, 350));
         setRawCandles(generateDemoCandles(a.symbol, tf, lim));
         setFunding(null);
+        setSourceDetail('Demo simulator (seeded random-walk)');
         setSource('demo');
         setPrice(null);
       } else {
@@ -163,6 +168,7 @@ export default function App() {
         await tick();
         const provider = providerForMarket(m);
         const data = await provider.getCandles({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo, timeframe: tf, limit: lim });
+        setSourceDetail(provider.lastSource || provider.label);
         setStage('Calculating indicators…');
         await tick();
         setRawCandles(data);
@@ -185,6 +191,7 @@ export default function App() {
     } catch (e) {
       setRawCandles([]);
       setFunding(null);
+      setSourceDetail('');
       setPrice(null);
       setError(e?.message || UNAVAILABLE);
     } finally {
@@ -276,17 +283,38 @@ export default function App() {
   const riskEff = useMemo(() => ({ ...risk, funding: useFunding ? funding : null }), [risk, funding, useFunding]);
   const ind = useMemo(() => (candles.length ? computeAll(candles) : null), [candles]);
   const ict = useMemo(() => (candles.length ? analyzeICT(candles) : null), [candles]);
-  const signal = useMemo(
-    () => (candles.length && ind ? buildSignal(candles, ind, ict, weights) : null),
-    [candles, ind, ict, weights]
-  );
-  const result = useMemo(
-    () => (candles.length && ind ? runBacktest(candles, ind, strategyId, riskEff) : null),
-    [candles, ind, strategyId, riskEff]
-  );
-  const strategy = getStrategy(strategyId);
-  const lastClose = candles.length ? candles[candles.length - 1].close : null;
   const regime = useMemo(() => (candles.length && ind ? detectRegime(candles, ind) : null), [candles, ind]);
+  const signal = useMemo(
+    () => (candles.length && ind ? buildSignal(candles, ind, ict, weights, { regime, gateRegime }) : null),
+    [candles, ind, ict, weights, regime, gateRegime]
+  );
+  // Strategy params: user overrides merged over documented defaults.
+  const strategy = getStrategy(strategyId);
+  const sparams = useMemo(
+    () => ({ ...defaultsFor(strategy), ...(sparamsById[strategyId] || {}) }),
+    [strategy, strategyId, sparamsById]
+  );
+  const setParam = (key, val) => {
+    setSparamsById((prev) => ({ ...prev, [strategyId]: { ...(prev[strategyId] || {}), [key]: val } }));
+  };
+  const resetParams = () => {
+    setSparamsById((prev) => { const n = { ...prev }; delete n[strategyId]; return n; });
+  };
+  const result = useMemo(
+    () => (candles.length && ind ? runBacktest(candles, ind, strategyId, riskEff, sparams) : null),
+    [candles, ind, strategyId, riskEff, sparams]
+  );
+  const lastClose = candles.length ? candles[candles.length - 1].close : null;
+  const robotLine = useMemo(() => {
+    if (error) return 'No candles came back — the classroom below explains why.';
+    if (!signal) return 'Pick an asset and hit Fetch & Backtest.';
+    if (signal.gated) return `Regime veto! ${regime?.label || 'The regime'} overrules — patience.`;
+    const scored = signal.reasons.filter((r) => r.points > 0 && r.side !== 'neutral')
+      .sort((a, b) => b.points - a.points)[0];
+    if (signal.direction === 'BUY') return `Bullish here. ${scored ? scored.label + '.' : ''}`;
+    if (signal.direction === 'SELL') return `Bearish here. ${scored ? scored.label + '.' : ''}`;
+    return 'Mixed evidence — waiting is a position.';
+  }, [signal, error, regime]);
   const levels = useMemo(
     () => (candles.length && ind && signal && signal.direction !== 'NEUTRAL'
       ? tradeLevels(candles, ind, ict, signal.direction, riskEff) : null),
@@ -303,19 +331,21 @@ export default function App() {
   const runCompare = () => {
     if (!candles.length || !ind) return;
     const ids = compareIds.length ? compareIds : STRATEGIES.map((s) => s.id);
-    setCompared(compareSelected(candles, ind, ids, riskEff));
+    const byId = {};
+    for (const s of STRATEGIES) byId[s.id] = { ...defaultsFor(s), ...(sparamsById[s.id] || {}) };
+    setCompared(compareSelected(candles, ind, ids, riskEff, byId));
   };
 
   const runWalkForward = () => {
     if (candles.length < 120 || !ind) return;
-    setWf(walkForward(candles, strategyId, riskEff, 0.7, 200));
+    setWf(walkForward(candles, strategyId, riskEff, 0.7, 200, sparams));
   };
 
   const runMtf = async () => {
     if (!asset) return;
     setMtfLoading(true);
     try {
-      const tfs = ['15m', '1h', '4h', '1d'];
+      const tfs = ['5m', '15m', '1h', '4h', '1d'];
       const rows = [];
       for (const tf of tfs) {
         try {
@@ -388,7 +418,10 @@ export default function App() {
       <div className="wrap">
         {/* HERO */}
         <header className="hero" id="home">
-          <div className="robot-wrap"><Robot mood={signal?.direction} /></div>
+          <div className="robot-wrap" style={{ flexDirection: 'column', gap: 8 }}>
+            <div className="speech" aria-live="polite">{robotLine}</div>
+            <Robot mood={signal?.direction} />
+          </div>
           <div>
             <h1>🤖 <span className="grad">AI Trading Lab</span></h1>
             <p className="tagline"><b>Test. Analyze. Understand. Trade Smarter.</b> — a browser laboratory that backtests real market data, explains every signal, and shows its work. No black boxes.</p>
@@ -466,16 +499,19 @@ export default function App() {
                 <div className="seg">
                   {favorites.map((k) => {
                     const [fm, fs] = k.split('|');
-                    return (<button key={k} className="chip" title={`Load ${fs} on ${fm}`} onClick={() => {
-                      const fa = [...ASSETS, ...customs].find((x) => x.market === fm && x.symbol === fs) || assetsForMarket(fm).find((x) => x.symbol === fs);
-                      setMarket(fm); setSymbol(fs); setQuery(''); setCompared(null);
-                      setTimeout(() => fetchData({ market: fm, symbol: fs, asset: fa }), 0);
-                    }}>{fm === market && fs === symbol ? '● ' : ''}{fs}</button>);
+                    return (<span key={k} style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+                      <button className="chip" title={`Load ${fs} on ${fm}`} onClick={() => {
+                        const fa = [...ASSETS, ...customs].find((x) => x.market === fm && x.symbol === fs) || assetsForMarket(fm).find((x) => x.symbol === fs);
+                        setMarket(fm); setSymbol(fs); setQuery(''); setCompared(null);
+                        setTimeout(() => fetchData({ market: fm, symbol: fs, asset: fa }), 0);
+                      }}>{fm === market && fs === symbol ? '● ' : ''}{fs}</button>
+                      <button className="chip" title={`Remove ${fs} from favorites`} onClick={() => setFavorites((prev) => prev.filter((x) => x !== k))} style={{ padding: '8px 9px' }}>✕</button>
+                    </span>);
                   })}
                 </div>
               </div>
             )}
-            <p className="sub" style={{ marginTop: 10 }}>{asset?.name} · feed <code>{asset?.yahoo || asset?.ref}</code></p>
+            <p className="sub" style={{ marginTop: 10 }}>{asset?.name} · feed <code>{asset?.yahoo || asset?.ref}</code>{sourceDetail && source === 'live' && (<span> · via {sourceDetail}</span>)}</p>
           </div>
 
           <div className="card span4">
@@ -495,7 +531,26 @@ export default function App() {
             <div className="kv"><span>Entry</span><span style={{ textAlign: 'right', maxWidth: '65%' }}>{strategy.entry}</span></div>
             <div className="kv"><span>Exit</span><span style={{ textAlign: 'right', maxWidth: '65%' }}>{strategy.exit}</span></div>
             {(strategy.params || []).length > 0 && (
-              <p className="sub" style={{ marginTop: 6 }}>Defaults: {strategy.params.map((p) => `${p.label} ${p.def}`).join(' · ')}</p>
+              <div style={{ marginTop: 6 }}>
+                <label className="lbl">Strategy parameters (live — backtest updates instantly)</label>
+                {strategy.params.map((p) => (
+                  <div className="kv" key={p.key}>
+                    <span>{p.label}</span>
+                    <span><input
+                      type="number" min={p.min} max={p.max} step={p.step}
+                      value={sparams[p.key] ?? p.def}
+                      style={{ width: 90, padding: '6px 8px' }}
+                      onChange={(e) => {
+                        let v = Number(e.target.value);
+                        if (!Number.isFinite(v)) v = p.def;
+                        v = Math.min(p.max, Math.max(p.min, v));
+                        setParam(p.key, v);
+                      }}
+                    /></span>
+                  </div>
+                ))}
+                <div className="toolbar"><button className="btn ghost" onClick={resetParams}>Reset to defaults</button></div>
+              </div>
             )}
             <label className="lbl">Candles (50–1000)</label>
             <input type="range" min={50} max={1000} step={10} value={limit} onChange={(e) => setLimit(Number(e.target.value))} />
@@ -529,6 +584,12 @@ export default function App() {
               <div><label className="lbl">Leverage (×)</label><input type="number" step="1" min="1" max="50" value={risk.leverage || 1} onChange={(e) => setRisk({ ...risk, leverage: Math.min(50, Math.max(1, Number(e.target.value) || 1)) })} /></div>
               <div><label className="lbl">Score: technical %</label><input type="number" step="5" min="0" max="100" value={weights.technical} onChange={(e) => { const t = Math.min(100, Math.max(0, Number(e.target.value) || 60)); setWeights({ technical: t, ict: 100 - t }); }} /></div>
             </div>
+            <div className="seg" style={{ marginTop: 8 }}>
+              {[['Balanced', 60], ['Technical', 80], ['ICT-led', 25]].map(([name, t]) => (
+                <button key={name} className={weights.technical === t ? 'on chip' : 'chip'} onClick={() => setWeights({ technical: t, ict: 100 - t })}>{name} {t}/{100 - t}</button>
+              ))}
+            </div>
+            <label className="toggle"><input type="checkbox" checked={gateRegime} onChange={(e) => setGateRegime(e.target.checked)} /> Regime gate: veto signals that fight the {regime ? `${regime.emoji} ${regime.label}` : 'market'} regime</label>
             <label className="toggle"><input type="checkbox" checked={risk.allowShort} onChange={(e) => setRisk({ ...risk, allowShort: e.target.checked })} /> Allow short positions</label>
             <label className="toggle"><input type="checkbox" checked={useFunding} onChange={(e) => { setUseFunding(e.target.checked); setTimeout(() => fetchData({ useFunding: e.target.checked }), 0); }} /> Apply Hyperliquid perp funding as holding cost</label>
             <label className="toggle"><input type="checkbox" checked={demoMode} onChange={(e) => { setDemoMode(e.target.checked); setTimeout(() => fetchData({ demoMode: e.target.checked }), 0); }} /> Use clearly-labelled <b>&nbsp;demo data&nbsp;</b> (offline / testing)</label>
@@ -551,6 +612,7 @@ export default function App() {
             <div className="toolbar">
               <button className="btn pink" onClick={() => { setDemoMode(true); fetchData({ demoMode: true }); }}>🎭 Load DEMO (simulated) data</button>
               <button className="btn ghost" onClick={() => { setTimeframe('1d'); fetchData({ timeframe: '1d', demoMode: false }); }}>Try 1D live data</button>
+              <button className="btn ghost" onClick={() => { setView('learn'); setLearnFromError(true); }}>🎓 Explain what went wrong</button>
             </div>
           </div>
         )}
@@ -560,8 +622,8 @@ export default function App() {
           </div>
         )}
 
-        {/* RESULTS */}
-        {signal && result && !loading && !error && (
+        {/* RESULTS (or the classroom when data failed but the user asked why) */}
+        {!loading && ((signal && result && !error) || (error && view === 'learn')) && (
           <>
             <div className="card span12" style={{ marginTop: 16 }} id="signals">
               <div className="signal-banner">
@@ -626,6 +688,7 @@ export default function App() {
                 asset={asset} market={market} timeframe={timeframe} strategy={strategy}
                 candles={candles} source={source} result={result} signal={signal}
                 ict={ict} risk={risk} providerLabel={providerForMarket(market).label}
+                error={error} learnFromError={learnFromError}
               />
             ) : (
             <>
@@ -636,6 +699,13 @@ export default function App() {
                 <p className="sub">{candles.length} candles · toggle every overlay · ENTRY/SL/TP from SignalBot</p>
                 <CandleChart candles={candles} ind={ind} trades={ovTradesForChart} ict={ict} overlays={overlays} levels={levels} />
                 <OverlayToggles value={overlays} onChange={setOverlays} />
+                {ind?.atr && (
+                  <p className="sub" style={{ marginTop: 8 }}>
+                    ATR {fmtPrice(ind.atr[candles.length - 1] ?? NaN, asset.decimals)} ({(((ind.atr[candles.length - 1] ?? 0) / (lastClose || 1)) * 100).toFixed(2)}% of price)
+                    {ict?.session && (<span> · session: <b>{ict.session.name}{ict.session.killzone ? ' ⚡ killzone' : ''}</b></span>)}
+                    {ict?.prevDay && (<span> · PDH {fmtPrice(ict.prevDay.high, asset.decimals)} / PDL {fmtPrice(ict.prevDay.low, asset.decimals)}</span>)}
+                  </p>
+                )}
                 <div className="seg" style={{ marginTop: 8 }}>
                   <button className={showOsc.rsi ? 'on chip' : 'chip'} onClick={() => setShowOsc({ ...showOsc, rsi: !showOsc.rsi })}>{showOsc.rsi ? '☑' : '☐'} RSI panel</button>
                   <button className={showOsc.macd ? 'on chip' : 'chip'} onClick={() => setShowOsc({ ...showOsc, macd: !showOsc.macd })}>{showOsc.macd ? '☑' : '☐'} MACD panel</button>
@@ -660,6 +730,7 @@ export default function App() {
                   <Stat k="Largest win / loss" v={`${money(result.stats.largestWin)} / ${money(result.stats.largestLoss)}`} c="flat" />
                   <Stat k="Avg hold" v={`${result.stats.avgBars.toFixed(1)} bars`} c="flat" />
                 </div>
+                <p className="sub" style={{ marginTop: 6 }}>Sharpe-like = mean/std of per-bar equity returns (scaled) — rough across timeframes, best used for ranking strategies, not as gospel.</p>
                 {wfWarnings.length > 0 && (
                   <div style={{ marginTop: 10 }}>
                     {wfWarnings.map((w, i) => (
@@ -679,7 +750,7 @@ export default function App() {
                   <button className="btn ghost" onClick={doCopy}>📋 Copy summary</button>
                 </div>
                 <h2 style={{ marginTop: 14 }}>🔁 Walk-forward (70/30)</h2>
-                <p className="sub">Train on the first 70%, test on the last 30% (indicators recomputed per side — no peeking).</p>
+                <p className="sub">Train on the first 70%, test on the last 30% (indicators recomputed per side — no peeking). Out-of-sample restarts from the same starting capital for a clean comparison.</p>
                 {!wf && <button className="btn ghost" onClick={runWalkForward} disabled={candles.length < 120}>Run walk-forward</button>}
                 {wf && (
                   <div>
@@ -923,7 +994,21 @@ function RiskCalc({ asset, levels, lastClose, balance }) {
   );
 }
 
-function LearnTab({ asset, market, timeframe, strategy, candles, source, result, signal, ict, risk, providerLabel }) {
+function LearnTab({ asset, market, timeframe, strategy, candles, source, result, signal, ict, risk, providerLabel, error, learnFromError }) {
+  // Classroom mode when the fetch itself failed: explain THIS error, then static lessons.
+  if (!result || !signal || !candles.length) {
+    return (
+      <>
+        {error && (
+          <div className="card" style={{ marginTop: 16 }}>
+            <div className="alert err">🔌 <b>Why “{error}” happened on {asset?.symbol} {timeframe}</b><br />
+              Your browser asked {providerLabel} for candles and got no usable answer. Usual culprits: a rate-limit (too many clicks too fast), the network/proxy hiccuping (Yahoo has no CORS headers, so we hop through a public proxy that sometimes returns 520), or a market too young for this timeframe (Hyperliquid xyz perps start late-2025). Fixes in order: wait 10 seconds → Retry · switch timeframe · load clearly-labelled DEMO data. Nothing was backtested — the lab refuses to invent candles.</div>
+          </div>
+        )}
+        <StaticHelp />
+      </>
+    );
+  }
   const st = result.stats;
   const first = candles[0], last = candles[candles.length - 1];
   const periodMove = first && last ? ((last.close - first.close) / first.close) * 100 : 0;
@@ -978,6 +1063,14 @@ function LearnTab({ asset, market, timeframe, strategy, candles, source, result,
         </div>
       </div>
 
+      <StaticHelp />
+    </>
+  );
+}
+
+function StaticHelp() {
+  return (
+    <>
       <div className="card" style={{ marginTop: 16 }}>
         <h2>🔎 When something looks wrong</h2>
         <p className="sub">The three confusions beginners hit most — including the search one.</p>

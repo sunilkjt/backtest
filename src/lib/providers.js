@@ -41,9 +41,9 @@ export class MarketDataProvider {
   async discover() { return []; }
 }
 
-export const TF_MS = { '15m': 15 * 60e3, '1h': 36e5, '4h': 4 * 36e5, '1d': 864e5, '1w': 7 * 864e5 };
-const BINANCE_INTERVAL = { '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w' };
-const HL_INTERVAL = { '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w' };
+export const TF_MS = { '1m': 60e3, '5m': 5 * 60e3, '15m': 15 * 60e3, '1h': 36e5, '4h': 4 * 36e5, '1d': 864e5, '1w': 7 * 864e5 };
+const BINANCE_INTERVAL = { '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w' };
+const HL_INTERVAL = { '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w' };
 
 // ---------------- Hyperliquid (public perps market data, no keys) ----------------
 // Core perps (BTC, ETH…) live on the default dex; stocks/forex/commodities
@@ -184,6 +184,8 @@ export class CryptoProvider extends MarketDataProvider {
 // full intraday history but also no CORS headers, so we fetch it through a
 // CORS-friendly proxy fallback (AllOrigins, then corsproxy.io). No keys.
 const YAHOO_CONF = {
+  '1m': { interval: '1m', range: '5d', resample: 1 },
+  '5m': { interval: '5m', range: '1mo', resample: 1 },
   '15m': { interval: '15m', range: '1mo', resample: 1 },
   '1h': { interval: '1h', range: '6mo', resample: 1 },
   '4h': { interval: '1h', range: '1y', resample: 4 },
@@ -245,27 +247,35 @@ function resampleCandles(candles, factor) {
   return out;
 }
 
+// Last successful route, for honest UI attribution ("via AllOrigins", …).
+// Shape: { candles, via } — via ∈ yahoo-direct | allorigins | corsproxy.
 async function fetchYahooCandles(ySym, timeframe) {
   const conf = YAHOO_CONF[timeframe];
   if (!conf) throw new Error(UNAVAILABLE);
   const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=${conf.interval}&range=${conf.range}`;
-  const attempts = [
-    yahooUrl,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(yahooUrl)}`,
-    `https://corsproxy.io/?url=${encodeURIComponent(yahooUrl)}`
+  const routes = [
+    { via: 'yahoo-direct', url: yahooUrl },
+    { via: 'allorigins', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(yahooUrl)}` },
+    { via: 'corsproxy', url: `https://corsproxy.io/?url=${encodeURIComponent(yahooUrl)}` }
   ];
   let lastErr = null;
-  for (const url of attempts) {
-    try {
-      const json = await fetchJson(url, {}, 20000);
-      const parsed = parseYahooChart(json);
-      if (parsed.length >= 10) return resampleCandles(parsed, conf.resample);
-      lastErr = new Error('empty');
-    } catch (e) {
-      lastErr = e;
+  // Two passes: fast first attempt on every route, then one retry pass over
+  // the proxies only (direct rarely recovers; proxies often do after 520s).
+  for (let pass = 0; pass < 2; pass++) {
+    for (const r of routes) {
+      if (pass === 1 && r.via === 'yahoo-direct') continue;
+      if (pass === 1) await new Promise((res) => setTimeout(res, 1200));
+      try {
+        const json = await fetchJson(r.url, {}, 20000);
+        const parsed = parseYahooChart(json);
+        if (parsed.length >= 10) return { candles: resampleCandles(parsed, conf.resample), via: r.via };
+        lastErr = new Error('empty');
+      } catch (e) {
+        lastErr = e;
+      }
     }
   }
-  throw lastErr? new Error(UNAVAILABLE) : new Error(UNAVAILABLE);
+  throw lastErr ? new Error(UNAVAILABLE) : new Error(UNAVAILABLE);
 }
 
 // Stooq CSV kept as a last-resort fallback for daily/weekly.
@@ -296,8 +306,14 @@ class StooqProvider extends MarketDataProvider {
     if (timeframe === '1w') return 'w';
     return null;
   }
-  yahooFirst(req, timeframe, limit) {
-    return fetchYahooCandles(yahooSymbol(req), timeframe).then((c) => c.slice(-limit));
+  // Human-readable route of the last successful fetch (shown in the UI).
+  get lastSource() { return this._lastSource || null; }
+  async yahooFirst(req, timeframe, limit) {
+    const { candles, via } = await fetchYahooCandles(yahooSymbol(req), timeframe);
+    this._lastSource = via === 'yahoo-direct' ? 'Yahoo Finance (direct)'
+      : via === 'allorigins' ? 'Yahoo Finance (via AllOrigins proxy)'
+      : 'Yahoo Finance (via corsproxy.io)';
+    return candles.slice(-limit);
   }
   async getCandles(req) {
     const { ref, timeframe, limit = 300 } = req;
@@ -319,6 +335,7 @@ class StooqProvider extends MarketDataProvider {
     if (!text || text.includes('Exceeded') || text.trim().split('\n').length < 5) throw new Error(UNAVAILABLE);
     const candles = parseStooqCsv(text);
     if (!candles.length) throw new Error(UNAVAILABLE);
+    this._lastSource = 'Stooq (fallback)';
     return candles.slice(-limit);
   }
   async getPrice(req) {

@@ -68,25 +68,25 @@ export function analyzeICT(candles) {
   cluster(swings.highs.slice(-14), 'high');
   cluster(swings.lows.slice(-14), 'low');
 
-  // Sweeps: wick beyond swing then close back inside
+  // Sweeps: wick beyond swing then close back inside (price kept for overlays)
   const recentHighs = swings.highs.slice(-6);
   const recentLows = swings.lows.slice(-6);
   for (let i = Math.max(10, n - 120); i < n; i++) {
     for (const s of recentLows) {
       if (s.index < i - 25 || s.index >= i) continue;
       if (candles[i].low < s.price && candles[i].close > s.price) {
-        events.push({ index: i, type: 'sweep-low', label: `Liquidity sweep of lows @ ${fmtP(s.price)}`, direction: 1 });
+        events.push({ index: i, type: 'sweep-low', label: `Liquidity sweep of lows @ ${fmtP(s.price)}`, direction: 1, price: s.price });
       }
     }
     for (const s of recentHighs) {
       if (s.index < i - 25 || s.index >= i) continue;
       if (candles[i].high > s.price && candles[i].close < s.price) {
-        events.push({ index: i, type: 'sweep-high', label: `Liquidity sweep of highs @ ${fmtP(s.price)}`, direction: -1 });
+        events.push({ index: i, type: 'sweep-high', label: `Liquidity sweep of highs @ ${fmtP(s.price)}`, direction: -1, price: s.price });
       }
     }
   }
 
-  // BOS / CHOCH: close beyond last opposite swing
+  // BOS / CHOCH: close beyond last opposite swing (level kept for overlays)
   let lastHigh = null, lastLow = null;
   let trend = 0; // 1 up, -1 down
   for (let i = 0; i < n; i++) {
@@ -95,7 +95,7 @@ export function analyzeICT(candles) {
     if (sh) {
       if (lastHigh != null && candles[i].close > lastHigh.price) {
         const isChoch = trend === -1;
-        events.push({ index: i, type: isChoch ? 'choch-bull' : 'bos-bull', label: `${isChoch ? 'CHOCH' : 'BOS'} bullish — close above ${fmtP(lastHigh.price)}`, direction: 1 });
+        events.push({ index: i, type: isChoch ? 'choch-bull' : 'bos-bull', label: `${isChoch ? 'CHOCH' : 'BOS'} bullish — close above ${fmtP(lastHigh.price)}`, direction: 1, price: lastHigh.price });
         trend = 1;
       }
       lastHigh = sh;
@@ -103,7 +103,7 @@ export function analyzeICT(candles) {
     if (sl) {
       if (lastLow != null && candles[i].close < lastLow.price) {
         const isChoch = trend === 1;
-        events.push({ index: i, type: isChoch ? 'choch-bear' : 'bos-bear', label: `${isChoch ? 'CHOCH' : 'BOS'} bearish — close below ${fmtP(lastLow.price)}`, direction: -1 });
+        events.push({ index: i, type: isChoch ? 'choch-bear' : 'bos-bear', label: `${isChoch ? 'CHOCH' : 'BOS'} bearish — close below ${fmtP(lastLow.price)}`, direction: -1, price: lastLow.price });
         trend = -1;
       }
       lastLow = sl;
@@ -232,6 +232,10 @@ export function analyzeICT(candles) {
   const bias = score >= 58 ? 'BULLISH' : score <= 42 ? 'BEARISH' : 'NEUTRAL';
 
   const sess = sessionFor(candles[n - 1].timestamp);
+  // Session bias follows the most recent displacement (within 10 bars):
+  // killzone moves with initiative behind them score higher.
+  const lastDisp = displacement.length ? displacement[displacement.length - 1] : null;
+  sess.bias = lastDisp && lastDisp.index >= n - 10 ? lastDisp.direction : 0;
 
   return {
     swings, classified, events: events.slice(-30), orderBlocks: orderBlocks.slice(-10),

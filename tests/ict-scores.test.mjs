@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { analyzeICT } from '../src/lib/ict.js';
 import { technicalScore, ictScore, combineScores, detectRegime, tradeLevels } from '../src/lib/scores.js';
+import { buildSignal } from '../src/lib/signals.js';
 import { computeAll } from '../src/lib/indicators.js';
 import { generateDemoCandles } from '../src/lib/demo.js';
 
@@ -45,8 +46,7 @@ describe('ICT/SMC', () => {
   });
 });
 
-describe('scores / regime / levels', () => {
-  it('scores stay in 0..100 and list every component', () => {
+describe('scores / regime / levels', () => {  it('scores stay in 0..100 and list every component', () => {
     const candles = generateDemoCandles('SOL', '1h', 300);
     const ind = computeAll(candles);
     const ict = analyzeICT(candles);
@@ -70,5 +70,31 @@ describe('scores / regime / levels', () => {
     assert.ok(L.stop < L.entry && L.takeProfit > L.entry && L.rr === 2);
     const S = tradeLevels(candles, ind, ict, 'SELL', { stopAtrMult: 2, takeProfitRR: 2 });
     assert.ok(S.stop > S.entry && S.takeProfit < S.entry);
+  });
+  it('session bias follows the latest displacement', () => {
+    const candles = [];
+    let t = 0;
+    for (let i = 0; i < 40; i++) { const p = 100 + Math.sin(i / 3); candles.push(C(t += 36e5, p, p + 0.5, p - 0.5, p)); }
+    candles.push(C(t += 36e5, 100, 106, 99.5, 105.5)); // strong bullish displacement last
+    const r = analyzeICT(candles);
+    assert.equal(r.session.bias, 1);
+  });
+  it('regime gate vetoes counter-regime signals below 78', () => {
+    // Deterministic demo seed that scores a sub-78 BUY (verified: BUY 77).
+    const candles = generateDemoCandles('BTC', '1h', 300);
+    const ind = computeAll(candles);
+    const ict = analyzeICT(candles);
+    const free = buildSignal(candles, ind, ict, { technical: 60, ict: 40 });
+    assert.equal(free.direction, 'BUY');
+    assert.ok(free.score < 78, `premise: score ${free.score} must be under 78`);
+    const gated = buildSignal(candles, ind, ict, { technical: 60, ict: 40 },
+      { gateRegime: true, regime: { label: 'Strong Bear Trend', detail: 'test' } });
+    assert.equal(gated.direction, 'NEUTRAL');
+    assert.equal(gated.gated, true);
+    assert.equal(gated.veto, 'BUY');
+    assert.ok(gated.reasons.some((r) => r.group === 'gate'));
+    const agree = buildSignal(candles, ind, ict, { technical: 60, ict: 40 },
+      { gateRegime: true, regime: { label: 'Strong Bull Trend', detail: 'test' } });
+    assert.equal(agree.direction, 'BUY');
   });
 });

@@ -64,4 +64,49 @@ describe('backtester', () => {
       }
     }
   });
+  it('params still respect no-lookahead when overridden', () => {
+    const candles = generateDemoCandles('ETH', '1h', 200);
+    const ind = computeAll(candles);
+    const p = { fast: 10, slow: 30, oversold: 40, overbought: 60, votes: 2, channel: 10, atrPeriod: 5, mult: 2, window: 8, lookback: 8, reclaimBars: 5, swingLR: 5 };
+    for (const strat of STRATEGIES) {
+      const i = 150;
+      const expect = strat.signal(candles, ind, i, p);
+      const doctored = candles.map((c, j) => (j > i ? { ...c, close: c.close * 2, high: c.high * 2, low: c.low * 2 } : c));
+      assert.equal(strat.signal(doctored, computeAll(doctored), i, p), expect, `${strat.id} leaks with params`);
+    }
+  });
+});
+
+describe('strategy params', () => {
+  it('lossRate is 0 (not 100) when no trades fire', () => {
+    const s = calcStats([], [], 10000);
+    assert.equal(s.trades, 0);
+    assert.equal(s.winRate, 0);
+    assert.equal(s.lossRate, 0);
+  });
+  it('rsi-rev gates change the signal series', () => {
+    const candles = generateDemoCandles('BTC', '1h', 300);
+    const ind = computeAll(candles);
+    const strat = STRATEGIES.find((s) => s.id === 'rsi-rev');
+    const a = candles.map((_, i) => (i === 0 ? 0 : strat.signal(candles, ind, i, {})));
+    const b = candles.map((_, i) => (i === 0 ? 0 : strat.signal(candles, ind, i, { oversold: 50, overbought: 50 })));
+    assert.ok(a.some((v, i) => v !== b[i]), 'wider gates must change at least one signal');
+  });
+  it('sma-cross periods change the signal series', () => {
+    const candles = generateDemoCandles('BTC', '1h', 400);
+    const ind = computeAll(candles);
+    const strat = STRATEGIES.find((s) => s.id === 'sma-cross');
+    const a = candles.map((_, i) => (i === 0 ? 0 : strat.signal(candles, ind, i, {})));
+    const b = candles.map((_, i) => (i === 0 ? 0 : strat.signal(candles, ind, i, { fast: 10, slow: 30 })));
+    assert.ok(a.some((v, i) => v !== b[i]), 'different windows must cross at different bars');
+  });
+  it('params flow into runBacktest + walkForward', () => {
+    const candles = generateDemoCandles('BTC', '1h', 400);
+    const ind = computeAll(candles);
+    const r1 = runBacktest(candles, ind, 'rsi-rev', { initialCapital: 10000 }, {});
+    const r2 = runBacktest(candles, ind, 'rsi-rev', { initialCapital: 10000 }, { oversold: 50, overbought: 50 });
+    assert.ok(r1.stats.trades !== r2.stats.trades, 'params must affect the backtest');
+    const wf = walkForward(candles, 'rsi-rev', { initialCapital: 10000 }, 0.7, 200, { oversold: 50 });
+    assert.ok(wf.oos.trades.every((t) => t.entryIdx >= wf.cut));
+  });
 });

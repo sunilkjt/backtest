@@ -85,7 +85,7 @@ export default function EquityChart({ equity, initial, trades = [], height = 200
     ctx.font = '11px system-ui';
     ctx.fillText(fmt(hi), W - 56, 14);
     ctx.fillText(fmt(lo), W - 56, H - 8);
-  });
+  }, [view, initial, height]);
 
   return (
     <div>

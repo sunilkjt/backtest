@@ -47,7 +47,7 @@ function closePosition(position, exitPrice, exitIndex, exitTime, r, reason) {
   };
 }
 
-export function runBacktest(candles, ind, strategyId, risk = {}) {
+export function runBacktest(candles, ind, strategyId, risk = {}, sparams = {}) {
   const r = { ...DEFAULT_RISK, ...risk };
   const lev = Math.max(1, Number(r.leverage) || 1);
   const strat = getStrategy(strategyId);
@@ -101,9 +101,9 @@ export function runBacktest(candles, ind, strategyId, risk = {}) {
       }
     }
 
-    // 2) strategy signal
+    // 2) strategy signal (user params threaded through — defaults when absent)
     let sig = 0;
-    try { sig = strat.signal(candles, ind, i); } catch { sig = 0; }
+    try { sig = strat.signal(candles, ind, i, sparams); } catch { sig = 0; }
     if (sig !== 0 && !(sig === -1 && !r.allowShort)) {
       if (position) {
         const t = closePosition(position, price, i, candles[i].timestamp, r, 'reverse');
@@ -180,6 +180,7 @@ export function calcStats(trades, equity, initialCapital) {
 
   const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0);
   const winRate = n > 0 ? (wins.length / n) * 100 : 0;
+  const lossRate = n > 0 ? (losses.length / n) * 100 : 0;
   const avgWin = wins.length ? grossProfit / wins.length : 0;
   const avgLoss = losses.length ? grossLoss / losses.length : 0;
   const expectancy = n > 0 ? totalNet / n : 0;
@@ -188,7 +189,7 @@ export function calcStats(trades, equity, initialCapital) {
   const worst = n ? Math.min(...trades.map((t) => t.net)) : 0;
 
   return {
-    trades: n, wins: wins.length, losses: losses.length, winRate, lossRate: 100 - winRate,
+    trades: n, wins: wins.length, losses: losses.length, winRate, lossRate,
     totalNet, totalReturnPct, finalEquity, profitFactor,
     maxDrawdown: maxDD, maxDrawdownPct: maxDDPct,
     sharpe, expectancy, avgWin, avgLoss, avgBars,
@@ -198,15 +199,15 @@ export function calcStats(trades, equity, initialCapital) {
 
 // Walk-forward: train on first `split` fraction (indicators recomputed on the
 // slice — no peeking), test on the rest with a warmup overlap for indicators.
-export function walkForward(candles, strategyId, risk = {}, split = 0.7, warmup = 200) {
+export function walkForward(candles, strategyId, risk = {}, split = 0.7, warmup = 200, sparams = {}) {
   const n = candles.length;
   const cut = Math.max(60, Math.floor(n * split));
   const isCandles = candles.slice(0, cut);
-  const isRes = runBacktest(isCandles, computeAll(isCandles), strategyId, risk);
+  const isRes = runBacktest(isCandles, computeAll(isCandles), strategyId, risk, sparams);
   const start = Math.max(0, cut - warmup);
   const oosSlice = candles.slice(start);
   const oosInd = computeAll(oosSlice);
-  const oosRes = runBacktest(oosSlice, oosInd, strategyId, risk);
+  const oosRes = runBacktest(oosSlice, oosInd, strategyId, risk, sparams);
   const offset = start;
   const oosTrades = oosRes.trades
     .filter((t) => t.entryIdx + offset >= cut)
@@ -242,6 +243,6 @@ export function compareAll(candles, ind, risk) {
   return STRATEGIES.map((s) => runBacktest(candles, ind, s.id, risk));
 }
 
-export function compareSelected(candles, ind, ids, risk) {
-  return STRATEGIES.filter((s) => ids.includes(s.id)).map((s) => runBacktest(candles, ind, s.id, risk));
+export function compareSelected(candles, ind, ids, risk, sparamsById = {}) {
+  return STRATEGIES.filter((s) => ids.includes(s.id)).map((s) => runBacktest(candles, ind, s.id, risk, sparamsById[s.id] || {}));
 }
