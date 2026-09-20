@@ -94,6 +94,7 @@ body {
 
 /* Layout */
 .grid { display: grid; gap: 16px; }
+.grid > * { min-width: 0; } /* tracks must never blow out on narrow screens */
 .deck { grid-template-columns: repeat(12, 1fr); margin-top: 16px; }
 .card {
   background: var(--card);
@@ -195,8 +196,9 @@ canvas.chart { width: 100%; display: block; border-radius: 14px; background: rgb
 .legend i { display: inline-block; width: 22px; height: 4px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
 .alert { border: 1px solid rgba(251,191,36,.5); background: rgba(251,191,36,.1); border-radius: 14px; padding: 12px 14px; font-size: 13.5px; }
 .alert.err { border-color: rgba(251,113,133,.5); background: rgba(251,113,133,.1); }
-.footer { color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+.footer { color: var(--muted); font-size: 12.5px; line-height: 1.6; overflow-wrap: anywhere; }
 .footer a { color: var(--neon-cyan); }
+.price-pill { flex-wrap: wrap; row-gap: 6px; }
 .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .kv { display: flex; justify-content: space-between; font-size: 13px; padding: 5px 0; border-bottom: 1px dashed rgba(255,255,255,.08); }
 .kv span:first-child { color: var(--muted); }
@@ -251,6 +253,16 @@ canvas.chart { width: 100%; display: block; border-radius: 14px; background: rgb
   .tbl-wrap { max-height: 260px; }
   .reason { grid-template-columns: 22px 1fr auto; }
   .why-grid { grid-template-columns: 1fr !important; }
+  /* narrow screens: stack control pairs so inputs never force page width */
+  .row2 { grid-template-columns: 1fr; }
+  .date-fields { grid-template-columns: 1fr; }
+  select, input[type='number'], input[type='text'], input[type='date'] { min-width: 0; }
+  .stats { grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); }
+  .market-seg button { padding: 9px 8px; font-size: 12.5px; }
+  .asset-grid { grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); }
+  .kv { gap: 8px; }
+  .kv span { min-width: 0; }
+  .kv span:last-child { overflow-wrap: anywhere; }
 }
 
 /* Floating scroll-to-top arrow */

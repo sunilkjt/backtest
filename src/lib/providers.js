@@ -232,22 +232,30 @@ function parseYahooChart(json) {
   return out;
 }
 
-function resampleCandles(candles, factor) {
-  if (!factor || factor <= 1) return candles;
-  const out = [];
-  for (let i = 0; i < candles.length; i += factor) {
-    const chunk = candles.slice(i, i + factor);
-    if (!chunk.length) continue;
-    out.push({
-      timestamp: chunk[0].timestamp,
-      open: chunk[0].open,
-      high: Math.max(...chunk.map((c) => c.high)),
-      low: Math.min(...chunk.map((c) => c.low)),
-      close: chunk[chunk.length - 1].close,
-      volume: chunk.reduce((s, c) => s + (c.volume || 0), 0)
-    });
+// 4H buckets align to UTC session boundaries (00/04/08/12/16/20), never to
+// "every 4th returned candle". Incomplete (forming) buckets are kept as the
+// last bar and ordered oldest-first.
+export function resampleToBucket(candles, bucketMs) {
+  const buckets = new Map();
+  for (const c of candles || []) {
+    if (!Number.isFinite(c.timestamp)) continue;
+    const b = Math.floor(c.timestamp / bucketMs) * bucketMs;
+    const g = buckets.get(b);
+    if (!g) {
+      buckets.set(b, { timestamp: b, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 });
+    } else {
+      g.high = Math.max(g.high, c.high);
+      g.low = Math.min(g.low, c.low);
+      g.close = c.close;
+      g.volume += c.volume || 0;
+    }
   }
-  return out;
+  return [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([, g]) => g);
+}
+
+export function resampleCandles(candles, factor) {
+  if (!factor || factor <= 1) return candles;
+  return resampleToBucket(candles, factor * 3600e3);
 }
 
 // Last successful route, for honest UI attribution ("via AllOrigins", …).
@@ -390,6 +398,51 @@ export function providerForMarket(market) {
     case 'commodities': return new CommodityProvider();
     default: return new CryptoProvider();
   }
+}
+
+// One fetch path for every consumer (main analysis AND MTF). Hyperliquid is
+// tried according to `preferYahoo`; when HL has no such coin and the request
+// is Yahoo-eligible, Yahoo spot serves as backup — always labeled, never
+// pretending to be Hyperliquid data. Providers are injectable for tests.
+export async function loadCandlesWithFallback(
+  { market, symbol, ref, yahoo, timeframe, limit = 300, preferYahoo = false },
+  deps = {}
+) {
+  const primary = deps.primary || providerForMarket(market);
+  const base = String(ref || '').includes(':') ? String(ref).split(':').slice(1).join(':') : symbol;
+  const ySym = yahoo || (market === 'hyperliquid' ? guessStockYahoo(base) : null);
+  const fallback = deps.fallback || new StockProvider();
+  const primaryReq = { symbol, ref, yahoo, timeframe, limit };
+  const yahooReq = { symbol: ySym, ref: ySym, yahoo: ySym, timeframe, limit };
+  const hlFirst = !preferYahoo;
+  if (market === 'hyperliquid' && ySym) {
+    if (hlFirst) {
+      try {
+        const candles = await primary.getCandles(primaryReq);
+        return { candles, source: 'hyperliquid', via: primary.lastSource || primary.label, usedFallback: false };
+      } catch (firstErr) {
+        try {
+          const candles = await fallback.getCandles(yahooReq);
+          return { candles, source: 'yahoo-fallback', via: fallback.lastSource || 'Yahoo Finance', usedFallback: true };
+        } catch {
+          throw firstErr;
+        }
+      }
+    }
+    try {
+      const candles = await fallback.getCandles(yahooReq);
+      return { candles, source: 'yahoo-fallback', via: fallback.lastSource || 'Yahoo Finance', usedFallback: true };
+    } catch (firstErr) {
+      try {
+        const candles = await primary.getCandles(primaryReq);
+        return { candles, source: 'hyperliquid', via: primary.lastSource || primary.label, usedFallback: false };
+      } catch {
+        throw firstErr; // user picked Yahoo: report the Yahoo failure honestly
+      }
+    }
+  }
+  const candles = await primary.getCandles(primaryReq);
+  return { candles, source: primary.id || market, via: primary.lastSource || primary.label, usedFallback: false };
 }
 
 // ---------------- Hyperliquid stock fallback ----------------

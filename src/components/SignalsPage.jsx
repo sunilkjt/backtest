@@ -2,10 +2,10 @@ import { useMemo } from 'react';
 import CandleChart from './CandleChart.jsx';
 import IctPanel from './IctPanel.jsx';
 import MarketPicker from './MarketPicker.jsx';
-import { liquidationPrice } from '../lib/riskModels.js';
+import { candleStatus } from '../lib/tradePlan.js';
 import {
   categoryBreakdown, setupStrength, computePools, liquidityMap,
-  sessionInfo, sizeFor, buildTradePlan, whyWait, assessSetup
+  sessionInfo, whyWait, assessSetup
 } from '../lib/setup.js';
 import { causalFor, stateAt } from '../lib/ictEngine.js';
 
@@ -25,10 +25,14 @@ export default function SignalsPage(props) {
     providerLabel, onAnalyze, analyzing, lastUpdated, autoRefresh, setAutoRefresh,
     minConf, setMinConf, minRR, setMinRR, tz, setTz, sizer, setSizer,
     history, histFilter, setHistFilter, onClearHistory, focus, setFocus,
-    overlays, statusForHistory, marketProps
+    overlays, statusForHistory, marketProps, plan: canonicalPlan, dataSource
   } = props;
+  // The canonical plan (built once in App) is the ONLY trade math on this
+  // page — entry/SL/TP/RR/size/P&L/liquidation all come from it.
+  const plan = canonicalPlan;
   const dec = asset?.decimals ?? 2;
   const n = candles.length;
+  const barStatus = candleStatus(candles, timeframe);
   const pickerCard = (
     <div className="card" style={{ marginTop: 16 }}>
       <h2>💱 Market & Asset</h2>
@@ -37,41 +41,60 @@ export default function SignalsPage(props) {
     </div>
   );
 
-  const setup = useMemo(() => {
+  const engine = useMemo(() => {
     if (!n || !ind || !signal) return null;
     const eng = causalFor(candles);
     const st = stateAt(eng, n - 1);
     const pools = computePools(st.swingsH, st.swingsL);
-    const dir = signal.direction === 'BUY' ? 1 : signal.direction === 'SELL' ? -1 : 0;
-    const plan = dir ? buildTradePlan({ candles, ind, eng, levels, dir, pools, prevDay: ict?.prevDay, prevWeek: ict?.prevWeek }) : null;
-    const assessment = assessSetup({ candles, eng, signal, plan, mtf, minConf, minRR, gated: signal.gated });
-    // Badge = the signal call (BUY/SELL/STRONG…). Tradability filters such as
-    // min-confluence and min-RR live in assessment.status, shown as its own
-    // "Setup status" stat — they must not glue the badge to NO TRADE.
-    const strength = signal.direction === 'NEUTRAL'
-      ? { label: 'NO TRADE', emoji: '⚪' }
+    return { eng, st, pools };
+  }, [n, candles, ind, signal]);
+  const dir = signal?.direction === 'BUY' ? 1 : signal?.direction === 'SELL' ? -1 : 0;
+
+  // Badge = the signal call (or INVALID — never a trade direction on a bad
+  // plan). Tradability filters live in assessment.status below.
+  const badge = !signal || signal.direction === 'NEUTRAL'
+    ? { label: 'NO TRADE', emoji: '⚪' }
+    : plan && plan.status === 'INVALID'
+      ? { label: 'INVALID', emoji: '⚪' }
       : setupStrength(signal.direction, signal.score, 'CONFIRMED');
-    const risks = dir ? whyWait({ candles, ind, eng, signal, regime, mtf, plan, minRR, dir }) : [];
-    const liq = liquidityMap({ pools, sweeps: st.sweeps, prevDay: ict?.prevDay, prevWeek: ict?.prevWeek, lastClose: candles[n - 1].close });
-    const sess = sessionInfo(candles, tz);
-    const techRows = categoryBreakdown(signal.tech.components);
-    const ictRows = categoryBreakdown(signal.ictS.components);
-    return { eng, st, pools, dir, plan, assessment, strength, risks, liq, sess, techRows, ictRows };
-  }, [n, candles, ind, signal, ict, levels, mtf, minConf, minRR, tz, regime]);
 
-  const sizing = useMemo(() => {
-    if (!setup?.plan) return null;
-    const entry = setup.plan.zone[0] === setup.plan.zone[1] ? setup.plan.entry : (setup.plan.zone[0] + setup.plan.zone[1]) / 2;
-    const s = sizeFor({
-      balance: sizer.balance, riskPct: sizer.riskPct,
-      entry, stop: setup.plan.stop, takeProfit: setup.plan.t1.price, lev: sizer.lev
+  const assessment = useMemo(() => {
+    if (!signal || !engine) return null;
+    if (!plan || plan.status === 'INVALID') {
+      return {
+        status: 'NO TRADE',
+        statusReasons: !plan
+          ? ['No directional edge — confluence sits at neutral.']
+          : [...plan.validation.reasons]
+      };
+    }
+    return assessSetup({ candles, eng: engine.eng, signal, plan, mtf, minConf, minRR, gated: signal.gated });
+  }, [signal, engine, plan, candles, mtf, minConf, minRR]);
+
+  const risks = useMemo(() => {
+    if (!signal || !engine || !dir) return [];
+    return whyWait({ candles, ind, eng: engine.eng, signal, regime, mtf, plan, minRR, dir });
+  }, [signal, engine, dir, candles, ind, regime, mtf, plan, minRR]);
+
+  const liq = useMemo(() => {
+    if (!engine || !n) return { buySide: [], sellSide: [] };
+    return liquidityMap({
+      pools: engine.pools, sweeps: engine.st.sweeps,
+      prevDay: ict?.prevDay, prevWeek: ict?.prevWeek, lastClose: candles[n - 1].close
     });
-    // Leverage bites through liquidation: isolated-margin approximation.
-    const liq = sizer.lev > 1 && setup.dir !== 0 ? liquidationPrice('isolated-simple', entry, setup.dir, sizer.lev) : null;
-    return { ...s, entry, liq };
-  }, [setup, sizer]);
+  }, [engine, n, candles, ict]);
 
-  if (!n || !signal || !setup) {
+  const sess = useMemo(() => (n ? sessionInfo(candles, tz) : null), [n, candles, tz]);
+  const techRows = useMemo(() => (signal ? categoryBreakdown(signal.tech.components) : []), [signal]);
+  const ictRows = useMemo(() => (signal ? categoryBreakdown(signal.ictS.components) : []), [signal]);
+
+  const mtfAgree = useMemo(() => {
+    const ok = (mtf || []).filter((r) => r.ok);
+    if (!ok.length || !dir || !signal) return false;
+    return new Set(ok.map((r) => r.direction)).size === 1 && ok[0].direction === signal.direction;
+  }, [mtf, dir, signal]);
+
+  if (!n || !signal || !engine) {
     return (
       <>
         {pickerCard}
@@ -86,8 +109,7 @@ export default function SignalsPage(props) {
     );
   }
 
-  const { plan, assessment, strength, risks, liq, sess, techRows, ictRows } = setup;
-  const dir = setup.dir;
+  const sizing = plan?.sizing?.valid ? plan.sizing : null;
   const meterLabel = signal.score >= 70 ? 'STRONG CONFLUENCE' : signal.score >= 55 ? 'MODERATE CONFLUENCE' : 'WEAK CONFLUENCE';
   const statusEmoji = { 'CONFIRMED': '🟢', 'DEVELOPING': '🟡', 'WAIT FOR CONFIRMATION': '🟠', 'INVALIDATED': '🔴', 'NO TRADE': '⚪' }[assessment.status];
 
@@ -145,34 +167,118 @@ export default function SignalsPage(props) {
       </div>
 
       <div className="card" style={{ marginTop: 16 }}>
+        <h2>📡 SIGNAL</h2>
         <div className="signal-banner">
-          <div className={`signal-badge ${signal.direction}`} style={{ minWidth: 190 }}>
-            {strength.emoji} {strength.label}
+          <div className={`signal-badge ${badge.label.includes('BUY') ? 'BUY' : badge.label.includes('SELL') ? 'SELL' : 'NEUTRAL'}`} style={{ minWidth: 190 }}>
+            {badge.emoji} {badge.label}
             <small>{signal.score}/100 · {signal.confidence}</small>
           </div>
           <div>
             <h2 style={{ margin: '0 0 6px' }}>{signal.score} / 100 — {meterLabel}</h2>
-            <p className="sub">This score measures agreement between the selected technical and ICT/SMC rules. It is <b>NOT</b> a probability of profit — never trade it as one.</p>
+            <p className="sub">Confidence {signal.score}/100 is an agreement meter across the checks below — <b>NOT</b> a probability of profit. Never trade it as one.</p>
             <div className="gauge"><div style={{ width: `${signal.score}%` }} /></div>
             <div className="gauge-marks"><span>0</span><span>40 sell edge</span><span>50 neutral</span><span>60 buy edge</span><span>100</span></div>
             <div className="stats" style={{ marginTop: 10 }}>
               <Stat k="Setup status" v={`${statusEmoji} ${assessment.status}`} c={assessment.status === 'CONFIRMED' ? 'good' : assessment.status === 'NO TRADE' || assessment.status === 'INVALIDATED' ? 'bad' : 'flat'} />
               <Stat k="Regime" v={`${regime?.emoji || ''} ${regime?.label || '—'}`} c="flat" />
-              <Stat k="Entry zone" v={plan ? `${fmtP(plan.zone[0], dec)} – ${fmtP(plan.zone[1], dec)}` : '—'} c="flat" />
-              <Stat k="Stop / invalidation" v={plan ? fmtP(plan.stop, dec) : '—'} c="bad" />
-              <Stat k="Target 1" v={plan ? `${fmtP(plan.t1.price, dec)} (${plan.t1.reason})` : '—'} c="good" />
-              <Stat k="Risk / reward" v={plan ? `1 : ${plan.rr.toFixed(2)}` : '—'} c="flat" />
+              <Stat k="Signal bar" v={barStatus.forming ? 'FORMING' : 'CLOSED'} c={barStatus.forming ? 'bad' : 'good'} />
+              <Stat k="Data source" v={props.dataSource || providerLabel} c="flat" />
             </div>
+            {barStatus.forming && (
+              <p className="sub" style={{ margin: '6px 0 0' }}>⚠️ {barStatus.label} — the verdict may change before the bar closes.</p>
+            )}
             {assessment.statusReasons.map((r, i) => (
               <p className="sub" key={i} style={{ margin: '6px 0 0' }}>{statusEmoji} {r}</p>
             ))}
+            {plan && plan.status === 'INVALID' && (
+              <div className="alert err" style={{ marginTop: 10 }}>⛔ <b>Invalid trade plan — not shown as BUY/SELL.</b><br />{plan.validation.reasons.join(' ')}</div>
+            )}
             {(() => {
-              const thesis = tradeThesis(signal, dir, strength);
+              const thesis = tradeThesis(signal, dir, badge);
               return thesis ? (<div className="alert" style={{ marginTop: 10 }}>📝 <b>Why this trade:</b> {thesis}</div>) : null;
             })()}
           </div>
         </div>
       </div>
+
+      {plan && plan.status === 'VALID' && (
+        <>
+          <div className="card" style={{ marginTop: 16 }}>
+            <h2>📐 TRADE PLAN — one canonical entry drives everything below</h2>
+            <p className="sub">Suggested entry <b>{fmtP(plan.entry, dec)}</b> is the approved execution price. The zone is the preferred limit region — its midpoint ({fmtP(plan.zoneMid, dec)}) is display only and enters no calculation.</p>
+            <div className="kv"><span>Suggested Entry ({plan.direction})</span><span><b>{fmtP(plan.entry, dec)}</b></span></div>
+            <div className="kv"><span>Entry Zone ({plan.zoneLabel})</span><span><b>{fmtP(plan.entryZone.low, dec)} – {fmtP(plan.entryZone.high, dec)}</b></span></div>
+            <div className="kv"><span>Stop Loss</span><span><b>{fmtP(plan.stopLoss, dec)}</b></span></div>
+            <div className="kv"><span>SL reason</span><span style={{ textAlign: 'right', maxWidth: '60%' }}>{plan.stopReason}</span></div>
+            <div className="kv"><span>SL distance</span><span><b>{fmtP(plan.stopDistance, dec)} ({plan.stopDistancePercent.toFixed(2)}%)</b></span></div>
+            <div className="kv"><span>Risk / unit</span><span><b>{fmtP(plan.riskPerUnit, dec)}</b></span></div>
+            {plan.targets.map((t, i) => (
+              <div key={t.key}>
+                <div className="kv"><span>{t.key} (TP{i + 1})</span><span><b>{fmtP(t.price, dec)}</b> · 1 : {t.rr.toFixed(2)}</span></div>
+                <div className="kv"><span>{t.key} reason</span><span style={{ textAlign: 'right', maxWidth: '60%' }}>{t.reason}{!t.meetsMinRR ? ` ⚠️ below ${plan.minRR[['tp1', 'tp2', 'tp3'][i]]}R minimum` : ''}</span></div>
+              </div>
+            ))}
+            <p className="sub" style={{ marginTop: 8 }}><b>Invalidation:</b> {plan.dir === 1
+              ? `Bullish setup fails on a close below ${plan.zoneLabel} / stop ${fmtP(plan.stopLoss, dec)}. Structure break against the trade confirms it.`
+              : `Bearish setup fails on a close above ${plan.zoneLabel} / stop ${fmtP(plan.stopLoss, dec)}. Structure break against the trade confirms it.`}</p>
+            <p className="sub"><b>Entry reason:</b> {entryReason({ st: engine.st, plan }, dir)}</p>
+          </div>
+
+          <div className="grid" style={{ gridTemplateColumns: 'repeat(12,1fr)', marginTop: 16 }}>
+            <div className="card span6">
+              <h2>💰 RISK — sized from tradePlan.entry ± stop</h2>
+              <div className="row2">
+                <div><label className="lbl">Account ($)</label><input type="number" value={sizer.balance} onChange={(e) => setSizer({ ...sizer, balance: Number(e.target.value) || 0 })} /></div>
+                <div><label className="lbl">Risk (%)</label><input type="number" step="0.25" value={sizer.riskPct} onChange={(e) => setSizer({ ...sizer, riskPct: Number(e.target.value) || 0 })} /></div>
+              </div>
+              <div className="row2">
+                <div><label className="lbl">Leverage (×)</label><input type="number" min="1" max="50" value={sizer.lev} onChange={(e) => setSizer({ ...sizer, lev: Math.min(50, Math.max(1, Number(e.target.value) || 1)) })} /></div>
+                <div />
+              </div>
+              {sizing ? (<>
+                <div className="kv"><span>Account balance</span><span><b>{money(sizer.balance)}</b></span></div>
+                <div className="kv"><span>Risk % / amount</span><span><b>{sizer.riskPct}% · {money(plan.sizing.riskAmount)}</b></span></div>
+                {plan.sizing.capped && <p className="sub">⚠️ {plan.sizing.reasons.join(' ')}</p>}
+                <div className="kv"><span>Position size</span><span><b>{plan.sizing.positionSize.toFixed(4)} {asset.symbol}</b></span></div>
+                <div className="kv"><span>Notional</span><span><b>{money(plan.sizing.notional)}</b></span></div>
+                <div className="kv"><span>Leverage</span><span><b>{plan.sizing.leverage}×</b></span></div>
+                <div className="kv"><span>Estimated margin</span><span><b>{money(plan.sizing.margin)}</b></span></div>
+                {plan.liq.price != null ? (
+                  <div className="kv"><span>Estimated liquidation ({plan.sizing.leverage}×)</span><span><b>{fmtP(plan.liq.price, dec)}</b></span></div>
+                ) : (
+                  <div className="kv"><span>Estimated liquidation</span><span><b>— none at 1× (raise leverage to see it)</b></span></div>
+                )}
+                <div className="kv"><span>Distance: entry → liq / entry → SL</span><span><b>{plan.liq.distance != null ? `${fmtP(plan.liq.distance, dec)} (${plan.liq.distancePct.toFixed(2)}%)` : '—'} / {fmtP(plan.liq.stopDistance, dec)} ({plan.liq.stopDistancePct.toFixed(2)}%)</b></span></div>
+                {plan.liq.warnings.map((w, i) => (
+                  <p className="sub" key={i} style={{ marginTop: 6 }}>🚨 {w} <i>({plan.liq.modelLabel})</i></p>
+                ))}
+              </>) : (<p className="sub">Sizer inactive — sizing inputs invalid.</p>)}
+            </div>
+            <div className="card span6">
+              <h2>📈 EXPECTED RESULT — same size, costs deducted</h2>
+              <p className="sub">Fees + slippage on entry and exit notionals, counted once each. {plan.fundingNote}</p>
+              {sizing ? (<>
+                {plan.targets.map((t, i) => {
+                  const e = [plan.expected.tp1, plan.expected.tp2, plan.expected.tp3][i];
+                  return (
+                    <div className="kv" key={t.key}><span>{t.key} profit (1 : {t.rr.toFixed(2)})</span><span><b>{money(e.gross)} gross · <span className="pos">{money(e.net)} net</span></b></span></div>
+                  );
+                })}
+                <div className="kv"><span>Maximum loss at SL</span><span className="neg"><b>{money(plan.maxLoss.gross)} gross · {money(plan.maxLoss.net)} net</b></span></div>
+              </>) : (<p className="sub">No expectancy without valid sizing.</p>)}
+              <h2 style={{ marginTop: 12 }}>🕐 Alignment</h2>
+              {!mtf && <button className="btn ghost" onClick={props.runMtf} disabled={mtfLoading}>{mtfLoading ? 'Scanning…' : 'Scan 5M / 15M / 1H / 4H / 1D'}</button>}
+              {mtf && (
+                <div className="tbl-wrap" style={{ maxHeight: 200 }}>
+                  <table><thead><tr><th>TF</th><th>Bias</th><th>Score</th><th>Src</th></tr></thead>
+                    <tbody>{mtf.map((r) => (<tr key={r.tf}><td><b>{r.tf}</b></td>{r.ok ? (<><td>{r.direction === 'BUY' ? '🟢' : r.direction === 'SELL' ? '🔴' : '🟡'} {r.direction}</td><td>{r.score}</td><td>{r.src || '—'}</td></>) : (<td colSpan={3}>—</td>)}</tr>))}</tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        </>
+      )}
 
       <div className="grid" style={{ gridTemplateColumns: 'repeat(12,1fr)', marginTop: 16 }}>
         <div className="card span6">
@@ -192,6 +298,13 @@ export default function SignalsPage(props) {
           ))}
           {(!signal.reasons.some((r) => r.points > 0 && (dir === 1 ? r.side === 'bull' : r.side === 'bear'))) && (
             <p className="sub">No supporting evidence on this side — that is exactly why the status reads {assessment.status}.</p>
+          )}
+          {mtfAgree && (
+            <div className="reason">
+              <span className={`dot ${dir === 1 ? 'bull' : 'bear'}`} />
+              <div><b>MTF agreement — every scanned timeframe says {signal.direction}</b><p>Same engine, regime logic and gate on 5M / 15M / 1H / 4H / 1D.</p></div>
+              <span className="pts">+✓</span>
+            </div>
           )}
         </div>
         <div className="card span6">
@@ -225,6 +338,7 @@ export default function SignalsPage(props) {
             ))}
           </div>
         </div>
+        <div className="kv" style={{ marginTop: 8 }}><span>Total confidence</span><span><b>{signal.score}/100 ({signal.confidence})</b> — agreement meter across detected factors, not a win probability</span></div>
       </div>
 
       <div className="grid" style={{ gridTemplateColumns: 'repeat(12,1fr)', marginTop: 16 }}>
@@ -256,61 +370,10 @@ export default function SignalsPage(props) {
         </div>
       </div>
 
-      <div className="grid" style={{ gridTemplateColumns: 'repeat(12,1fr)', marginTop: 16 }}>
-        <div className="card span6">
-          <h2>📐 Trade plan</h2>
-          {plan ? (<>
-            <div className="kv"><span>Direction</span><span><b>{dir === 1 ? '🟢 LONG' : '🔴 SHORT'}</b></span></div>
-            <div className="kv"><span>Entry zone ({plan.zoneLabel})</span><span><b>{fmtP(plan.zone[0], dec)} – {fmtP(plan.zone[1], dec)}</b></span></div>
-            <div className="kv"><span>Invalidation / stop</span><span><b>{fmtP(plan.stop, dec)}</b></span></div>
-            {plan.targets.map((t) => (
-              <div className="kv" key={t.key}><span>{t.key} — {t.reason}</span><span><b>{fmtP(t.price, dec)}</b></span></div>
-            ))}
-            <div className="kv"><span>Risk / reward (vs T1)</span><span><b>1 : {plan.rr.toFixed(2)}</b></span></div>
-            <p className="sub" style={{ marginTop: 8 }}><b>Invalidation:</b> {plan.invalidation}</p>
-            <p className="sub"><b>Entry reason:</b> {entryReason(setup, dir)}</p>
-          </>) : (<p className="sub">No plan — {assessment.statusReasons.join(' ')}</p>)}
-        </div>
-        <div className="card span6">
-          <h2>📏 Position sizer (approx)</h2>
-          <div className="row2">
-            <div><label className="lbl">Account ($)</label><input type="number" value={sizer.balance} onChange={(e) => setSizer({ ...sizer, balance: Number(e.target.value) || 0 })} /></div>
-            <div><label className="lbl">Risk (%)</label><input type="number" step="0.25" value={sizer.riskPct} onChange={(e) => setSizer({ ...sizer, riskPct: Number(e.target.value) || 0 })} /></div>
-          </div>
-          <div className="row2">
-            <div><label className="lbl">Leverage (×)</label><input type="number" min="1" max="50" value={sizer.lev} onChange={(e) => setSizer({ ...sizer, lev: Math.min(50, Math.max(1, Number(e.target.value) || 1)) })} /></div>
-            <div />
-          </div>
-          {sizing && plan ? (<>
-            <div className="kv"><span>Risk $</span><span><b>{money(sizing.maxLoss)}</b></span></div>
-            <div className="kv"><span>Size</span><span><b>{sizing.qty.toFixed(4)} {asset.symbol}</b></span></div>
-            <div className="kv"><span>Notional / margin ({sizer.lev}×)</span><span><b>${sizing.notional.toFixed(0)} / ${sizing.margin.toFixed(0)}</b></span></div>
-            <div className="kv"><span>Reward at T1</span><span className="pos"><b>{money(sizing.profit)}</b></span></div>
-            {sizing.liq != null ? (
-              <div className="kv"><span>Liquidation (≈ isolated, {sizer.lev}×)</span><span><b>{fmtP(sizing.liq, dec)}</b></span></div>
-            ) : (
-              <div className="kv"><span>Liquidation</span><span><b>— none at 1× (raise leverage to see it)</b></span></div>
-            )}
-            {sizing.liq != null && Math.abs(sizing.entry - sizing.liq) < Math.abs(sizing.entry - plan.stop) * 1.5 && (
-              <p className="sub" style={{ marginTop: 6 }}>🚨 Liquidation sits uncomfortably close to your stop at {sizer.lev}× — lower the leverage or widen the distance.</p>
-            )}
-          </>) : (<p className="sub">Sizer activates once a plan exists.</p>)}
-          <h2 style={{ marginTop: 12 }}>🕐 Alignment</h2>
-          {!mtf && <button className="btn ghost" onClick={props.runMtf} disabled={mtfLoading}>{mtfLoading ? 'Scanning…' : 'Scan 5M / 15M / 1H / 4H / 1D'}</button>}
-          {mtf && (
-            <div className="tbl-wrap" style={{ maxHeight: 200 }}>
-              <table><thead><tr><th>TF</th><th>Bias</th><th>Score</th></tr></thead>
-                <tbody>{mtf.map((r) => (<tr key={r.tf}><td><b>{r.tf}</b></td>{r.ok ? (<><td>{r.direction === 'BUY' ? '🟢' : r.direction === 'SELL' ? '🔴' : '🟡'} {r.direction}</td><td>{r.score}</td></>) : (<td colSpan={2}>—</td>)}</tr>))}</tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </div>
-
       <div className="card" style={{ marginTop: 16 }}>
         <h2>📈 Evidence chart — verify the setup visually</h2>
-        <p className="sub">Entry/SL/T1–T3 plotted. Click ICT rows above to spotlight a bar.</p>
-        <CandleChart candles={candles} ind={ind} trades={[]} ict={ict} overlays={overlays} levels={plan ? { entry: plan.entry, stop: plan.stop, targets: plan.targets } : (props.levels ? { ...props.levels, targets: [{ key: 'TP', price: props.levels.takeProfit }] } : null)} focus={focus} />
+        <p className="sub">Entry/SL/T1–T3 plotted from the canonical plan. Click ICT rows above to spotlight a bar.</p>
+        <CandleChart candles={candles} ind={ind} trades={[]} ict={ict} overlays={overlays} levels={plan && plan.status === 'VALID' ? { entry: plan.entry, stop: plan.stopLoss, targets: plan.targets.map((t) => ({ key: t.key, price: t.price })) } : (props.levels ? { ...props.levels, targets: [{ key: 'TP', price: props.levels.takeProfit }] } : null)} focus={focus} />
       </div>
 
       <div className="card" style={{ marginTop: 16 }}>

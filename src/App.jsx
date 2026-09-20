@@ -3,13 +3,15 @@ import Robot from './components/Robot.jsx';
 import CandleChart, { OscillatorPanel, OverlayToggles, DEFAULT_OVERLAYS } from './components/CandleChart.jsx';
 import EquityChart from './components/EquityChart.jsx';
 import { MARKETS, TIMEFRAMES, ASSETS, assetsForMarket, hlCategory } from './lib/assets.js';
-import { providerForMarket, UNAVAILABLE, StockProvider, guessStockYahoo } from './lib/providers.js';
+import { providerForMarket, UNAVAILABLE, StockProvider, guessStockYahoo, loadCandlesWithFallback } from './lib/providers.js';
 import { computeAll } from './lib/indicators.js';
 import { STRATEGIES, getStrategy, defaultsFor } from './lib/strategies.js';
 import { runBacktest, compareSelected, walkForward, overfitWarnings, DEFAULT_RISK } from './lib/backtest.js';
 import { analyzeICT } from './lib/ict.js';
 import { buildSignal, DEFAULT_WEIGHTS } from './lib/signals.js';
-import { detectRegime, tradeLevels, dayChange } from './lib/scores.js';
+import { detectRegime, dayChange } from './lib/scores.js';
+import { causalFor } from './lib/ictEngine.js';
+import { buildCanonicalPlan } from './lib/tradePlan.js';
 import { liquidationPrice, liqLabel, PERIODS_PER_YEAR } from './lib/riskModels.js';
 import { generateDemoCandles } from './lib/demo.js';
 import { tradesToCsv, signalsToCsv, strategyToJson, analysisReport, download, summaryText } from './lib/export.js';
@@ -233,58 +235,24 @@ export default function App() {
         setStage(`Downloading ${a.symbol} ${tf} from ${providerForMarket(m).label}…`);
         await tick();
         const provider = providerForMarket(m);
-        let fetched;
-        let effectiveProvider = provider;
-        let usedFallback = false;
-        // Hyperliquid stock routing: bare-ticker "Yahoo fallback" assets try
-        // Yahoo spot first with HL as backup; everything else tries
-        // Hyperliquid first with Yahoo spot as backup. Either way the label
-        // below always says which feed actually served the candles.
+        // One shared fetch path (main analysis AND MTF) with Hyperliquid →
+        // Yahoo fallback. Order: bare-ticker Yahoo-fallback assets try Yahoo
+        // spot first (that is what the user picked); everything else —
+        // including xyz: refs — tries Hyperliquid first so a listed perp is
+        // never misrouted to spot.
         const base = String(a.ref || '').includes(':') ? String(a.ref).split(':').slice(1).join(':') : a.symbol;
         const ySym = a.yahoo || (m === 'hyperliquid' ? guessStockYahoo(base) : null);
-        // Order: bare-ticker Yahoo-fallback assets try Yahoo spot first (that
-        // is what the user picked); everything else — including xyz: refs —
-        // tries Hyperliquid first so a listed perp is never misrouted to spot.
-        const hlFirst = !(m === 'hyperliquid' && ySym && a.fallback === 'yahoo' && !String(a.ref || '').includes(':'));
-        let firstErr = null;
-        const tryHl = async () => provider.getCandles({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo, timeframe: tf, limit: lim });
-        const tryYahoo = async () => {
-          const fb = new StockProvider();
-          const rows = await fb.getCandles({ symbol: ySym, ref: ySym, yahoo: ySym, timeframe: tf, limit: lim });
-          return { rows, fb };
-        };
-        if (m === 'hyperliquid' && ySym) {
-          if (hlFirst) {
-            try { fetched = await tryHl(); }
-            catch (e) {
-              firstErr = e;
-              setStage(`${a.symbol} is not on Hyperliquid — trying Yahoo Finance…`);
-              await tick();
-              try {
-                const r = await tryYahoo();
-                fetched = r.rows; effectiveProvider = r.fb; usedFallback = true;
-              } catch { throw firstErr; }
-            }
-          } else {
-            try {
-              const r = await tryYahoo();
-              fetched = r.rows; effectiveProvider = r.fb; usedFallback = true;
-            } catch (e) {
-              firstErr = e;
-              setStage(`Yahoo has no ${a.symbol} — trying Hyperliquid…`);
-              await tick();
-              try { fetched = await tryHl(); effectiveProvider = provider; usedFallback = false; }
-              catch { throw firstErr; }
-            }
-          }
-        } else {
-          fetched = await tryHl();
-        }
+        const preferYahoo = m === 'hyperliquid' && !!ySym && a.fallback === 'yahoo' && !String(a.ref || '').includes(':');
+        const loaded = await loadCandlesWithFallback({
+          market: m, symbol: a.symbol, ref: a.ref, yahoo: a.yahoo, timeframe: tf, limit: lim, preferYahoo
+        });
         if (stale()) return null;
+        const fetched = loaded.candles;
+        const usedFallback = loaded.usedFallback;
+        const effectiveProvider = usedFallback ? new StockProvider() : provider;
         data = fetched;
         if (usedFallback) {
-          const via = effectiveProvider.lastSource ? ` (${effectiveProvider.lastSource})` : '';
-          setSourceDetail(`Yahoo Finance fallback${via} — ${a.symbol} is not listed on Hyperliquid`);
+          setSourceDetail(`Yahoo Finance fallback (${loaded.via}) — ${a.symbol} is not listed on Hyperliquid`);
           setFallbackNote(`${a.symbol} is not listed on Hyperliquid — showing Yahoo Finance spot data, not a perp.`);
         } else {
           setSourceDetail(provider.lastSource || provider.label);
@@ -515,11 +483,38 @@ export default function App() {
     if (signal.direction === 'SELL') return `Bearish here. ${scored ? scored.label + '.' : ''}`;
     return 'Mixed evidence — waiting is a position.';
   }, [signal, error, regime]);
-  const levels = useMemo(
-    () => (candles.length && ind && signal && signal.direction !== 'NEUTRAL'
-      ? tradeLevels(candles, ind, ict, signal.direction, riskEff) : null),
-    [candles, ind, ict, signal, riskEff]
-  );
+  // Canonical live trade plan — the single authority behind the Signals tab,
+  // the chart plan overlay and the history stop. Entry/SL/TP/RR/sizing/P&L
+  // all derive from tradePlan.entry (last close = approved market execution).
+  const canonicalPlan = useMemo(() => {
+    if (!candles.length || !ind || !signal) return null;
+    if (signal.direction !== 'BUY' && signal.direction !== 'SELL') return null;
+    const eng = causalFor(candles);
+    return buildCanonicalPlan({
+      candles, ind, eng, dir: signal.direction === 'BUY' ? 1 : -1,
+      entry: candles[candles.length - 1].close,
+      pools: ict?.pools || [], prevDay: ict?.prevDay || null, prevWeek: ict?.prevWeek || null,
+      account: { balance: sizer.balance, riskPct: sizer.riskPct },
+      leverage: sizer.lev,
+      costs: { feePct: risk.feePct, slippagePct: risk.slippagePct },
+      liqModel: risk.liquidationModel, liqMmr: risk.liquidationMmr,
+      stopAtrMult: risk.stopAtrMult
+    });
+  }, [candles, ind, ict, signal, sizer, risk]);
+  // Chart/RiskCalc/history levels are a thin view of the canonical plan —
+  // never a second calculation.
+  const levels = useMemo(() => {
+    if (!canonicalPlan || canonicalPlan.status !== 'VALID') return null;
+    return {
+      entry: canonicalPlan.entry,
+      stop: canonicalPlan.stopLoss,
+      takeProfit: canonicalPlan.targets[0].price,
+      targets: canonicalPlan.targets.map((t) => ({ key: t.key, price: t.price })),
+      rr: canonicalPlan.rr.tp1,
+      riskPct: canonicalPlan.stopDistancePercent,
+      dir: canonicalPlan.dir
+    };
+  }, [canonicalPlan]);
   const chg24 = useMemo(() => dayChange(candles), [candles]);
   const wfWarnings = useMemo(() => {
     if (!result) return [];
@@ -549,19 +544,27 @@ export default function App() {
       const rows = [];
       for (const tf of tfs) {
         try {
-          let data;
+          let data, src;
           if (source === 'demo') {
             data = generateDemoCandles(asset.symbol, tf, 220);
+            src = 'Demo';
           } else {
-            const provider = providerForMarket(market);
-            data = await provider.getCandles({ symbol: asset.symbol, ref: asset.ref, yahoo: asset.yahoo, timeframe: tf, limit: 220 });
+            // Same fetch path (and Hyperliquid→Yahoo fallback) as the main
+            // analysis — MTF must never use a divergent data source (§15).
+            const loaded = await loadCandlesWithFallback({
+              market, symbol: asset.symbol, ref: asset.ref, yahoo: asset.yahoo, timeframe: tf, limit: 220
+            });
+            data = loaded.candles;
+            src = loaded.usedFallback ? 'Yahoo ↩' : (market === 'hyperliquid' ? 'Hyperliquid' : market);
           }
           const ii = computeAll(data);
           const ic = analyzeICT(data);
-          const sg = buildSignal(data, ii, ic, weights);
-          rows.push({ tf, direction: sg.direction, score: sg.score, tech: sg.tech.score, ict: sg.ictS.score, ok: true });
+          // Same signal engine, regime logic and gate as the primary signal (§14).
+          const rg = detectRegime(data, ii);
+          const sg = buildSignal(data, ii, ic, weights, { regime: rg, gateRegime });
+          rows.push({ tf, direction: sg.direction, score: sg.score, tech: sg.tech.score, ict: sg.ictS.score, ok: true, src });
         } catch {
-          rows.push({ tf, ok: false });
+          rows.push({ tf, ok: false, src: '—' });
         }
       }
       setMtf(rows);
@@ -579,17 +582,31 @@ export default function App() {
     const ic = analyzeICT(data);
     const rg = detectRegime(data, ii);
     const sg = buildSignal(data, ii, ic, weights, { regime: rg, gateRegime });
-    const lv = sg.direction !== 'NEUTRAL' ? tradeLevels(data, ii, ic, sg.direction, { ...risk, funding: null }) : null;
+    // History stop comes from the canonical plan, not a second calculation.
+    let planStop = null;
+    if (sg.direction === 'BUY' || sg.direction === 'SELL') {
+      const planA = buildCanonicalPlan({
+        candles: data, ind: ii, eng: causalFor(data), dir: sg.direction === 'BUY' ? 1 : -1,
+        entry: data[data.length - 1].close,
+        pools: ic.pools || [], prevDay: ic.prevDay || null, prevWeek: ic.prevWeek || null,
+        account: { balance: sizer.balance, riskPct: sizer.riskPct },
+        leverage: sizer.lev,
+        costs: { feePct: risk.feePct, slippagePct: risk.slippagePct },
+        liqModel: risk.liquidationModel, liqMmr: risk.liquidationMmr,
+        stopAtrMult: risk.stopAtrMult
+      });
+      if (planA && planA.status === 'VALID') planStop = planA.stopLoss;
+    }
     const entry = {
       t: Date.now(), asset: (resolveAsset(market, symbol) || {}).symbol || symbol,
       market, tf: timeframe, strategy: getStrategy(strategyId).name,
       signal: sg.direction, score: sg.score, price: data[data.length - 1].close,
-      stop: lv ? lv.stop : null, dir: sg.direction === 'BUY' ? 1 : sg.direction === 'SELL' ? -1 : 0,
+      stop: planStop, dir: sg.direction === 'BUY' ? 1 : sg.direction === 'SELL' ? -1 : 0,
       status: sg.direction === 'NEUTRAL' ? 'NO TRADE' : 'ACTIVE'
     };
     setHistory(logSignal(entry));
     setLastUpdated(Date.now());
-  }, [fetchData, market, symbol, timeframe, strategyId, weights, gateRegime, risk, resolveAsset]);
+  }, [fetchData, market, symbol, timeframe, strategyId, weights, gateRegime, risk, sizer, resolveAsset]);
 
   const analyzeRef = useRef(analyzeMarket);
   analyzeRef.current = analyzeMarket;
@@ -709,6 +726,8 @@ export default function App() {
             focus={focus} setFocus={setFocus} overlays={overlays}
             lastClose={lastClose} error={error} marketProps={marketProps}
             fallbackNote={fallbackNote} timeframes={TIMEFRAMES} onPickTimeframe={pickTf}
+            plan={canonicalPlan}
+            dataSource={fallbackNote ? 'Yahoo Finance (fallback)' : providerForMarket(market).label}
           />
         ) : (
         <>
@@ -884,6 +903,7 @@ export default function App() {
               <div className="card span4" id="backtest">
                 <h2>💰 Performance</h2>
                 <p className="sub">Fees + slippage{useFunding && funding ? ' + funding' : ''} included · ATR ({risk.stopAtrMult}×) stops · {risk.takeProfitRR}R targets · {risk.leverage || 1}× leverage</p>
+                <p className="sub">Methodology: the backtester uses ATR stops + fixed-R targets. Live Signals use structure/liquidity stops + targets — the backtest measures the <i>strategy rule</i>, it does not validate the live trade plan.</p>
                 <div className="stats">
                   <Stat k="Initial → Final" v={`${money(risk.initialCapital)} → ${money(result.stats.finalEquity)}`} c="flat" />
                   <Stat k="Net P&L" v={`${money(result.stats.totalNet)}`} c={result.stats.totalNet > 0 ? 'good' : result.stats.totalNet < 0 ? 'bad' : 'flat'} />
@@ -999,7 +1019,7 @@ export default function App() {
                   <div>
                     <div className="tbl-wrap" style={{ maxHeight: 220 }}>
                       <table>
-                        <thead><tr><th>TF</th><th>Bias</th><th>Score</th><th>Tech</th><th>ICT</th></tr></thead>
+                        <thead><tr><th>TF</th><th>Bias</th><th>Score</th><th>Tech</th><th>ICT</th><th>Src</th></tr></thead>
                         <tbody>
                           {mtf.map((r) => (
                             <tr key={r.tf}>
@@ -1007,9 +1027,9 @@ export default function App() {
                               {r.ok ? (
                                 <>
                                   <td>{r.direction === 'BUY' ? '🟢 Bullish' : r.direction === 'SELL' ? '🔴 Bearish' : '🟡 Neutral'}</td>
-                                  <td>{r.score}</td><td>{r.tech}</td><td>{r.ict}</td>
+                                  <td>{r.score}</td><td>{r.tech}</td><td>{r.ict}</td><td>{r.src || '—'}</td>
                                 </>
-                              ) : (<td colSpan={4}>unavailable</td>)}
+                              ) : (<td colSpan={5}>unavailable</td>)}
                             </tr>
                           ))}
                         </tbody>
