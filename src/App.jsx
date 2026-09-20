@@ -193,6 +193,10 @@ export default function App() {
   }, [page, market, symbol, timeframe, strategyId, limit, risk, weights, overlays, showOsc, favorites, compareIds, sparamsById, gateRegime, minConf, minRR, tz, sizer]);
 
   const tick = () => new Promise((r) => setTimeout(r, 30));
+  // Request sequencing: rapid asset switches fire overlapping downloads and
+  // the LAST fetch to finish would win, showing another asset's data/signal.
+  // Each run takes a sequence number; stale runs bail before touching state.
+  const fetchSeq = useRef(0);
 
   const fetchData = useCallback(async (opts = {}) => {
     const m = opts.market ?? market;
@@ -204,6 +208,8 @@ export default function App() {
     const fundNow = opts.useFunding ?? useFunding;
     const a = resolveAsset(m, sym, opts.asset);
     if (!a) return;
+    const mySeq = ++fetchSeq.current;
+    const stale = () => mySeq !== fetchSeq.current;
     setLoading(true);
     setError('');
     setCompared(null);
@@ -215,6 +221,7 @@ export default function App() {
       if (useDemo) {
         setStage('Simulating demo candles…');
         await new Promise((r) => setTimeout(r, 350));
+        if (stale()) return null;
         data = generateDemoCandles(a.symbol, tf, lim);
         setRawCandles(data);
         setFunding(null);
@@ -273,6 +280,7 @@ export default function App() {
         } else {
           fetched = await tryHl();
         }
+        if (stale()) return null;
         data = fetched;
         if (usedFallback) {
           const via = effectiveProvider.lastSource ? ` (${effectiveProvider.lastSource})` : '';
@@ -297,12 +305,13 @@ export default function App() {
           setFunding(null);
         }
         setSource('live');
-        effectiveProvider.getPrice({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo }).then(setPrice).catch(() => {});
+        effectiveProvider.getPrice({ symbol: a.symbol, ref: a.ref, yahoo: a.yahoo }).then((p) => { if (!stale()) setPrice(p); }).catch(() => {});
       }
       setStage('Running backtest…');
       await tick();
       return data && data.length ? data : null;
     } catch (e) {
+      if (stale()) return null; // a newer request took over — leave its state alone
       setRawCandles([]);
       setFunding(null);
       setFallbackNote('');
@@ -311,8 +320,10 @@ export default function App() {
       setError(e?.message || UNAVAILABLE);
       return null;
     } finally {
-      setStage('');
-      setLoading(false);
+      if (!stale()) {
+        setStage('');
+        setLoading(false);
+      }
     }
   }, [market, symbol, timeframe, limit, demoMode, risk, useFunding, resolveAsset]);
 
